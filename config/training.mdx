@@ -1,0 +1,368 @@
+---
+title: "Training Hyperparameters and Settings"
+description: "Reference for Axolotl training hyperparameters: batch size, learning rate, optimizer, LR scheduler, gradient checkpointing, and evaluation settings."
+---
+
+These settings live in `HyperparametersConfig` (`src/axolotl/utils/schemas/training.py`) and the top-level `AxolotlInputConfig`. They control every aspect of the optimization loop, from how gradients are accumulated to how and when checkpoints are saved.
+
+## Batch size
+
+<ParamField path="micro_batch_size" type="integer" default="1">
+  Number of samples processed per GPU per forward pass. This is the per-device batch size.
+
+  The effective batch size is: `micro_batch_size × gradient_accumulation_steps × number_of_GPUs`.
+</ParamField>
+
+<ParamField path="gradient_accumulation_steps" type="integer" default="1">
+  Number of forward passes to accumulate gradients over before performing a parameter update. Use this to simulate larger batch sizes without additional VRAM.
+
+  ```yaml
+  micro_batch_size: 2
+  gradient_accumulation_steps: 8
+  # Effective batch size per GPU = 16
+  ```
+</ParamField>
+
+<ParamField path="eval_batch_size" type="integer">
+  Per-GPU batch size for evaluation. Defaults to `micro_batch_size`.
+</ParamField>
+
+## Steps and epochs
+
+<ParamField path="num_epochs" type="float" default="1.0">
+  Number of full passes through the training dataset. Accepts fractional values.
+</ParamField>
+
+<ParamField path="max_steps" type="integer">
+  Hard cap on optimizer steps. When set, it takes priority over `num_epochs`. Training stops at whichever limit is hit first.
+
+  ```yaml
+  max_steps: 500   # overrides num_epochs
+  ```
+</ParamField>
+
+## Learning rate
+
+<ParamField path="learning_rate" type="float" required>
+  Peak learning rate for the optimizer. Typical values for LoRA/QLoRA training are in the range `1e-4` to `3e-4`; full fine-tuning typically uses `1e-5` to `5e-5`.
+
+  ```yaml
+  learning_rate: 2e-4
+  ```
+</ParamField>
+
+<ParamField path="lr_scheduler" type="string" default="cosine">
+  Learning rate schedule. Supports all HuggingFace `SchedulerType` values plus:
+
+  | Value | Description |
+  |-------|-------------|
+  | `cosine` | Cosine decay (default) |
+  | `linear` | Linear warmup and decay |
+  | `constant` | Constant learning rate |
+  | `constant_with_warmup` | Constant after a warmup period |
+  | `one_cycle` | 1cycle policy |
+  | `rex` | Reverse Engineering the Schedule |
+</ParamField>
+
+<ParamField path="lr_scheduler_kwargs" type="object">
+  Additional keyword arguments passed to the scheduler constructor. Useful for scheduler-specific parameters not covered by other fields.
+</ParamField>
+
+<ParamField path="warmup_steps" type="integer">
+  Number of steps to linearly ramp up the learning rate from 0 to `learning_rate`. Cannot be combined with `warmup_ratio`.
+</ParamField>
+
+<ParamField path="warmup_ratio" type="float">
+  Fraction of total training steps used for warmup. For example, `0.03` means 3% of steps are warmup steps. Cannot be combined with `warmup_steps`.
+</ParamField>
+
+<ParamField path="cosine_min_lr_ratio" type="float">
+  Minimum learning rate as a fraction of the peak. For example, `0.1` causes the cosine schedule to decay to 10% of `learning_rate` rather than 0.
+</ParamField>
+
+<ParamField path="cosine_constant_lr_ratio" type="float">
+  Fraction of training steps at which the cosine decay reaches `cosine_min_lr_ratio` and holds constant. For example, `0.8` means the cosine ramp finishes at 80% of training.
+</ParamField>
+
+### Per-module learning rate groups
+
+You can assign different learning rates to specific modules using `lr_groups`. This is inspired by LoRA+.
+
+```yaml
+lr_groups:
+  - name: output_proj
+    modules:
+      - self_attn.o_proj.weight
+    lr: 1e-6
+  - name: q_proj_layer2
+    modules:
+      - model.layers.2.self_attn.q_proj.weight
+    lr: 1e-5
+
+learning_rate: 2e-5   # default for all other parameters
+```
+
+## Optimizer
+
+<ParamField path="optimizer" type="string" default="adamw_torch_fused">
+  Optimizer to use. Axolotl supports all HuggingFace `OptimizerNames` values plus several custom optimizers.
+
+  **Common choices:**
+
+  | Value | Description |
+  |-------|-------------|
+  | `adamw_torch_fused` | PyTorch fused AdamW (default, fast) |
+  | `adamw_torch` | Standard PyTorch AdamW |
+  | `adamw_bnb_8bit` | 8-bit AdamW via bitsandbytes (saves optimizer memory) |
+  | `paged_adamw_8bit` | Paged 8-bit AdamW |
+  | `paged_adamw_32bit` | Paged 32-bit AdamW |
+  | `lion_8bit` | 8-bit Lion optimizer |
+  | `lion_32bit` | 32-bit Lion optimizer |
+  | `adafactor` | Adafactor (low memory) |
+  | `sgd` | Stochastic Gradient Descent |
+  | `optimi_adamw` | Optimi AdamW |
+  | `adopt_adamw` | ADOPT AdamW (requires torch >= 2.5.1) |
+  | `came_pytorch` | CAME optimizer |
+  | `muon` | Muon optimizer |
+  | `dion` | Microsoft DION distributed optimizer |
+
+  See [Optimizers documentation](https://docs.axolotl.ai/docs/optimizers.html) for the full list and custom optimizer details.
+</ParamField>
+
+<ParamField path="weight_decay" type="float" default="0.0">
+  L2 regularization coefficient applied to non-bias parameters.
+</ParamField>
+
+<ParamField path="adam_beta1" type="float">
+  AdamW β₁ hyperparameter. Default varies by optimizer (usually `0.9`).
+</ParamField>
+
+<ParamField path="adam_beta2" type="float">
+  AdamW β₂ hyperparameter. Default varies by optimizer (usually `0.999`).
+</ParamField>
+
+<ParamField path="adam_epsilon" type="float">
+  AdamW ε numerical stability constant. Default varies by optimizer (usually `1e-8`).
+</ParamField>
+
+<ParamField path="max_grad_norm" type="float">
+  Maximum gradient norm for gradient clipping. Set to `1.0` as a safe default; omit to disable clipping.
+</ParamField>
+
+## Sequence and packing
+
+<ParamField path="sequence_len" type="integer" default="512">
+  Maximum token length for training inputs. Sequences longer than this are handled according to `excess_length_strategy`. Set to match your model's context window (e.g., `4096` or `8192`).
+</ParamField>
+
+<ParamField path="sample_packing" type="boolean">
+  Pack multiple short samples into a single sequence up to `sequence_len` using block-diagonal attention masks and per-sequence position IDs. Dramatically improves GPU utilization when training on short examples. Strongly recommended.
+
+  ```yaml
+  sample_packing: true
+  ```
+</ParamField>
+
+<ParamField path="pad_to_sequence_len" type="boolean">
+  Pad all batches to `sequence_len`. Reduces memory fragmentation and can prevent OOM errors. Enabled automatically when `sample_packing: true`.
+</ParamField>
+
+<ParamField path="train_on_inputs" type="boolean" default="false">
+  When `false` (default), only the assistant/completion tokens are included in the loss. When `true`, the entire sequence (including instruction/input) contributes to the loss.
+</ParamField>
+
+## Gradient checkpointing
+
+<ParamField path="gradient_checkpointing" type="boolean | string" default="false">
+  Trade compute for memory by recomputing activations during the backward pass instead of storing them. Essential for training long sequences or large models.
+
+  | Value | Description |
+  |-------|-------------|
+  | `true` | Standard gradient checkpointing |
+  | `false` | Disabled (default) |
+  | `"offload"` | Offload checkpointed activations to CPU |
+  | `"offload_disk"` | Offload checkpointed activations to disk |
+</ParamField>
+
+<ParamField path="gradient_checkpointing_kwargs" type="object">
+  Additional keyword arguments passed to the gradient checkpointing implementation.
+</ParamField>
+
+## Output directory
+
+<ParamField path="output_dir" type="string" default="./model-out">
+  Directory where model checkpoints and the final trained model are saved.
+
+  ```yaml
+  output_dir: ./outputs/my-lora
+  ```
+</ParamField>
+
+## Saving checkpoints
+
+<ParamField path="save_steps" type="integer | float">
+  Save a checkpoint every N optimizer steps. A float value is interpreted as a fraction of total steps. Leave empty to save at the end of each epoch.
+</ParamField>
+
+<ParamField path="saves_per_epoch" type="integer">
+  Number of checkpoints to save per epoch. Mutually exclusive with `save_steps`.
+</ParamField>
+
+<ParamField path="save_strategy" type="string">
+  When to save checkpoints. Options: `"steps"` (uses `save_steps`), `"epoch"`, `"best"` (requires `metric_for_best_model`), `"no"`.
+</ParamField>
+
+<ParamField path="save_total_limit" type="integer">
+  Maximum number of checkpoints to retain on disk. Older checkpoints are deleted automatically when this limit is reached.
+</ParamField>
+
+<ParamField path="save_only_model" type="boolean" default="false">
+  Save only model weights, skipping optimizer state. Smaller checkpoint size but training cannot be resumed from these checkpoints.
+</ParamField>
+
+### On-demand checkpointing
+
+You can trigger a checkpoint at any point during training without interrupting the run:
+
+```yaml
+dynamic_checkpoint:
+  enabled: true
+  check_interval: 100        # steps between file checks
+  trigger_file_path: "axolotl_checkpoint.save"
+```
+
+```bash
+# Trigger a checkpoint by creating the file:
+touch /path/to/output_dir/axolotl_checkpoint.save
+```
+
+## Evaluation
+
+<ParamField path="eval_steps" type="integer | float">
+  Run evaluation every N steps. A float value is interpreted as a fraction of total steps. Leave empty to evaluate at the end of each epoch.
+</ParamField>
+
+<ParamField path="evals_per_epoch" type="integer">
+  Number of evaluations per epoch. Mutually exclusive with `eval_steps`.
+</ParamField>
+
+<ParamField path="eval_strategy" type="string">
+  Evaluation schedule. Options: `"steps"`, `"epoch"`, `"no"`.
+</ParamField>
+
+<ParamField path="early_stopping_patience" type="integer">
+  Stop training when evaluation loss has not improved for this many consecutive evaluations.
+</ParamField>
+
+## Logging
+
+<ParamField path="logging_steps" type="integer">
+  Log training metrics to console (and any enabled logging integrations) every N steps.
+</ParamField>
+
+<ParamField path="use_tensorboard" type="boolean">
+  Enable TensorBoard logging. Logs are written to `output_dir`.
+</ParamField>
+
+### Weights and Biases
+
+<ParamField path="wandb_project" type="string">
+  W&B project name. When set, training metrics are automatically logged to Weights & Biases. Requires `WANDB_API_KEY` in the environment.
+</ParamField>
+
+<ParamField path="wandb_name" type="string">
+  Human-readable name for the W&B run.
+</ParamField>
+
+<ParamField path="wandb_entity" type="string">
+  W&B team or organization name.
+</ParamField>
+
+<ParamField path="wandb_mode" type="string">
+  Set to `"offline"` to save metadata locally without syncing, or `"disabled"` to disable W&B entirely.
+</ParamField>
+
+<ParamField path="wandb_log_model" type="string">
+  Log model artifacts to W&B. Set to `"checkpoint"` to upload every checkpoint, or `"end"` to upload only at the end of training.
+</ParamField>
+
+## Resuming training
+
+<ParamField path="resume_from_checkpoint" type="string">
+  Path to a specific checkpoint directory to resume training from.
+
+  ```yaml
+  resume_from_checkpoint: ./outputs/lora-out/checkpoint-500
+  ```
+</ParamField>
+
+<ParamField path="auto_resume_from_checkpoints" type="boolean">
+  Automatically resume from the latest checkpoint in `output_dir` if one exists. Use with care when switching between different model configs.
+</ParamField>
+
+## Example configs
+
+<Tabs>
+  <Tab title="LoRA fine-tune">
+    ```yaml
+    micro_batch_size: 2
+    gradient_accumulation_steps: 8
+    num_epochs: 3
+    learning_rate: 2e-4
+    optimizer: adamw_torch_fused
+    lr_scheduler: cosine
+    warmup_steps: 100
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    sequence_len: 4096
+    sample_packing: true
+    gradient_checkpointing: true
+
+    output_dir: ./outputs/lora-out
+    save_steps: 500
+    save_total_limit: 3
+    eval_steps: 500
+    logging_steps: 10
+
+    wandb_project: my-finetune
+    wandb_name: llama-lora-run1
+    ```
+  </Tab>
+  <Tab title="Full fine-tune">
+    ```yaml
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+    num_epochs: 1
+    learning_rate: 1e-5
+    optimizer: adamw_bnb_8bit
+    lr_scheduler: cosine
+    warmup_ratio: 0.03
+    weight_decay: 0.1
+    sequence_len: 8192
+    sample_packing: true
+    gradient_checkpointing: true
+
+    output_dir: ./outputs/full-finetune
+    save_steps: 200
+    save_total_limit: 2
+    ```
+  </Tab>
+  <Tab title="Memory-efficient">
+    ```yaml
+    micro_batch_size: 1
+    gradient_accumulation_steps: 32
+    num_epochs: 2
+    learning_rate: 2e-4
+    optimizer: paged_adamw_8bit
+    lr_scheduler: cosine
+    warmup_steps: 50
+    max_grad_norm: 1.0
+    sequence_len: 2048
+    sample_packing: true
+    pad_to_sequence_len: true
+    gradient_checkpointing: offload
+
+    output_dir: ./outputs/memory-efficient
+    ```
+  </Tab>
+</Tabs>

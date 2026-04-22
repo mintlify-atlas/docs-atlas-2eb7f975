@@ -1,0 +1,420 @@
+---
+title: "Axolotl CLI Command Reference"
+description: "Complete reference for axolotl CLI commands: train, preprocess, inference, merge-lora, evaluate, vllm-serve, fetch, and config-schema with flags and examples."
+---
+
+The Axolotl CLI provides a unified interface for every stage of the LLM fine-tuning workflow. All commands follow the same general structure and read from a YAML configuration file.
+
+```bash
+axolotl <command> [config.yml] [options]
+```
+
+The config file argument can be a local path or a URL pointing to a raw YAML file on the web. Commands that use multi-GPU launchers accept additional launcher arguments after a `--` separator.
+
+---
+
+## axolotl train
+
+Train or fine-tune a model using a configuration file. By default, training is launched via `accelerate launch` for automatic multi-GPU support.
+
+```bash
+axolotl train config.yml
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--launcher` | `accelerate \| torchrun \| python` | `accelerate` | Launcher for multi-GPU training |
+| `--cloud` | path | — | Path to a cloud accelerator config (Modal) |
+| `--sweep` | path | — | YAML sweep config for hyperparameter search |
+| `--debug` | flag | `false` | Enable debug mode with extra logging |
+| `--debug-text-only` | flag | `false` | Debug tokenization output without training |
+| `--debug-num-examples` | integer | `0` | Number of examples to print in debug mode |
+
+Any config YAML field can also be overridden as a CLI flag using its dash-case name:
+
+```bash
+axolotl train config.yml \
+  --learning-rate 1e-4 \
+  --micro-batch-size 2 \
+  --num-epochs 3
+```
+
+**Multi-GPU examples:**
+
+```bash
+# torchrun with 2 GPUs
+axolotl train config.yml --launcher torchrun -- --nproc_per_node=2
+
+# accelerate with a custom config
+axolotl train config.yml --launcher accelerate -- --config_file=accelerate_config.yml --num_processes=4
+
+# Python (single process, no launcher)
+axolotl train config.yml --launcher python
+```
+
+**Resume from checkpoint:**
+
+```bash
+axolotl train config.yml --resume-from-checkpoint ./outputs/lora-out/checkpoint-500
+```
+
+**Hyperparameter sweep:**
+
+```bash
+axolotl train config.yml --sweep sweep.yml
+```
+
+Example `sweep.yml`:
+
+```yaml
+_:
+  # Dependent variable groups (all keys in a group are swept together)
+  - load_in_4bit: false
+    adapter: lora
+  - load_in_4bit: true
+    adapter: qlora
+
+# Independent variables (all combinations are swept)
+learning_rate: [0.0003, 0.0006]
+lora_r: [16, 32]
+lora_alpha: [16, 32, 64]
+```
+
+---
+
+## axolotl preprocess
+
+Tokenize and cache your dataset before training. Running this first is strongly recommended for large datasets because it validates your config and eliminates tokenization overhead during training.
+
+```bash
+axolotl preprocess config.yml
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--debug` | flag | `false` | Print tokenized examples with label masking |
+| `--debug-text-only` | flag | `false` | Print examples as text only |
+| `--debug-num-examples` | integer | `1` | Number of examples to display |
+| `--download` | boolean | `true` | Download the model weights during preprocessing |
+| `--cloud` | path | — | Run preprocessing on Modal cloud |
+
+**Examples:**
+
+```bash
+# Preprocess on a single GPU
+CUDA_VISIBLE_DEVICES="0" axolotl preprocess config.yml
+
+# Inspect 5 tokenized training examples with label masking
+axolotl preprocess config.yml --debug --debug-num-examples 5
+
+# Preprocess on Modal cloud
+axolotl preprocess config.yml --cloud cloud_config.yml
+```
+
+<Tip>
+Set `dataset_prepared_path` in your config so the preprocessed Arrow cache is saved to disk. Subsequent training runs will load from the cache instantly.
+</Tip>
+
+---
+
+## axolotl inference
+
+Run interactive inference using a trained model. Supports both a CLI loop and a Gradio web interface.
+
+```bash
+axolotl inference config.yml --lora-model-dir ./outputs/lora-out
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--lora-model-dir` | path | — | Path to LoRA adapter weights |
+| `--base-model` | string | — | Path to a fully merged model |
+| `--gradio` | flag | `false` | Launch Gradio web UI instead of CLI |
+| `--launcher` | `accelerate \| torchrun \| python` | `accelerate` | Launcher |
+
+**Examples:**
+
+```bash
+# CLI inference with a LoRA adapter
+axolotl inference config.yml --lora-model-dir="./outputs/lora-out"
+
+# CLI inference with a fully merged model
+axolotl inference config.yml --base-model="./outputs/lora-out/merged"
+
+# Gradio web interface
+axolotl inference config.yml \
+  --lora-model-dir="./outputs/lora-out" \
+  --gradio
+
+# Pipe a prompt from a file
+cat prompt.txt | axolotl inference config.yml --base-model="./completed-model"
+```
+
+---
+
+## axolotl merge-lora
+
+Merge a trained LoRA adapter into the base model weights to produce a single standalone model checkpoint.
+
+```bash
+axolotl merge-lora config.yml
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--lora-model-dir` | path | — | Explicit path to LoRA adapter (overrides `output_dir` in config) |
+
+The merged model is saved under `<output_dir>/merged/`.
+
+**Examples:**
+
+```bash
+# Merge from a specific checkpoint
+axolotl merge-lora config.yml --lora-model-dir="./outputs/lora-out/checkpoint-1000"
+
+# Merge using CPU (when GPU VRAM is insufficient)
+CUDA_VISIBLE_DEVICES="" axolotl merge-lora config.yml
+```
+
+<Note>
+By default, Axolotl uses the memory-efficient merge method that processes model shards one at a time without loading the full model into VRAM. Set `merge_method: legacy` in your config to use the traditional approach instead.
+</Note>
+
+---
+
+## axolotl merge-sharded-fsdp-weights
+
+Combine sharded FSDP model checkpoint files into a single consolidated checkpoint.
+
+```bash
+axolotl merge-sharded-fsdp-weights config.yml
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--launcher` | Launcher to use (accelerate, torchrun, python) |
+
+---
+
+## axolotl evaluate
+
+Evaluate a model's loss and metrics on training and evaluation datasets without updating any weights.
+
+```bash
+axolotl evaluate config.yml
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--launcher` | `accelerate \| torchrun \| python` | `accelerate` | Launcher for multi-GPU evaluation |
+| `--debug` | flag | `false` | Enable debug logging |
+
+**Multi-GPU evaluation:**
+
+```bash
+axolotl evaluate config.yml --launcher torchrun -- --nproc_per_node=2
+```
+
+---
+
+## axolotl vllm-serve
+
+Start a vLLM inference server. Used primarily to provide fast token generation during GRPO or EBFT online RL training.
+
+```bash
+axolotl vllm-serve config.yml
+```
+
+**Flags:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--tensor-parallel-size` | integer | Number of tensor parallel workers |
+| `--data-parallel-size` | integer | Number of data parallel model replicas |
+| `--host` | string | Host address for the server |
+| `--port` | integer | Port for the server |
+| `--gpu-memory-utilization` | float | Fraction of GPU memory reserved (0.0–1.0) |
+| `--dtype` | string | Data type for generation (`auto`, `float16`, `bfloat16`) |
+| `--max-model-len` | integer | Maximum sequence length for the KV cache |
+| `--enable-prefix-caching` | boolean | Enable prefix caching in vLLM |
+
+---
+
+## axolotl fetch
+
+Download example configs and other resources to your local machine.
+
+```bash
+axolotl fetch <target> [--dest path]
+```
+
+**Targets:**
+
+| Target | Description |
+|--------|-------------|
+| `examples` | Example YAML configuration files for many model families |
+| `deepspeed_configs` | DeepSpeed ZeRO-2 and ZeRO-3 JSON configs |
+| `docs` | Full documentation source (Quarto markdown files) |
+
+**Examples:**
+
+```bash
+# Get example YAML configs
+axolotl fetch examples
+
+# Get DeepSpeed configs to a custom directory
+axolotl fetch deepspeed_configs --dest ./ds-configs
+
+# Get documentation sources
+axolotl fetch docs --dest ./axolotl-docs
+```
+
+---
+
+## axolotl lm-eval
+
+Run LM Evaluation Harness on a model to benchmark standardized academic tasks.
+
+```bash
+axolotl lm-eval config.yml
+```
+
+Configure evaluation tasks in your YAML:
+
+```yaml
+lm_eval_tasks:
+  - arc_challenge
+  - hellaswag
+  - mmlu
+lm_eval_batch_size: 8
+output_dir: ./eval-results
+```
+
+---
+
+## axolotl quantize
+
+Quantize a model using the quantization configuration in your YAML file.
+
+```bash
+axolotl quantize config.yml
+```
+
+---
+
+## axolotl delinearize-llama4
+
+Convert a Llama 4 linearized model back into a standard HuggingFace Llama 4 model.
+
+```bash
+axolotl delinearize-llama4 <model_dir> <output_dir>
+```
+
+<Note>
+Only works with non-quantized linearized models. If you trained a LoRA adapter on a linearized model, merge it first before delinearizing.
+</Note>
+
+---
+
+## axolotl agent-docs
+
+Display agent-optimized reference documentation for AI coding agents. All docs are bundled with the package and require no network access.
+
+```bash
+axolotl agent-docs [topic]
+```
+
+See [AI Agent Documentation](/cli/agent-docs) for full details and topic listing.
+
+---
+
+## axolotl config-schema
+
+Print the full JSON schema for all config fields. Useful for tooling, AI agents, and exploring all available options.
+
+```bash
+axolotl config-schema
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--format` | `json \| yaml` | `json` | Output format |
+| `--field` | string | — | Show schema for a single field only |
+
+**Examples:**
+
+```bash
+# Full JSON schema
+axolotl config-schema
+
+# YAML format
+axolotl config-schema --format yaml
+
+# Single field
+axolotl config-schema --field adapter
+
+# Pipe to jq to list all field names
+axolotl config-schema | jq '.properties | keys'
+```
+
+---
+
+## Remote compute with Modal
+
+Commands that support cloud execution via Modal accept a `--cloud` flag:
+
+```bash
+axolotl preprocess config.yml --cloud cloud_config.yml
+axolotl train config.yml --cloud cloud_config.yml
+axolotl lm-eval config.yml --cloud cloud_config.yml
+```
+
+**Cloud config example:**
+
+```yaml
+# cloud_config.yml
+provider: modal
+gpu: a100-80gb
+gpu_count: 2
+timeout: 86400
+secrets:
+  - HF_TOKEN
+  - WANDB_API_KEY
+volumes:
+  - name: axolotl-cache
+    mount: /workspace/cache
+```
+
+## Legacy CLI usage
+
+The original module-based CLI is still supported for backward compatibility. Note that flag names use underscores instead of dashes:
+
+```bash
+# Preprocess
+python -m axolotl.cli.preprocess config.yml
+
+# Train
+accelerate launch -m axolotl.cli.train config.yml
+
+# Inference with LoRA
+accelerate launch -m axolotl.cli.inference config.yml \
+  --lora_model_dir="./outputs/lora-out"
+```
+
+<Warning>
+The legacy CLI uses underscore notation for flags (`--lora_model_dir`), while the current Click-based CLI uses dash notation (`--lora-model-dir`). Do not mix the two.
+</Warning>

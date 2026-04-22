@@ -1,0 +1,247 @@
+---
+title: "Dataset Configuration for Axolotl Training"
+description: "Configure one or more training datasets in Axolotl: HuggingFace paths, dataset types, splits, preprocessing options, validation splits, and parallel processing."
+---
+
+Axolotl loads and preprocesses one or more datasets as defined by the `datasets` key in your config. Each entry in the list is an independent dataset that can come from HuggingFace Hub, a local file, or cloud storage. They are merged and optionally shuffled before training.
+
+## datasets list
+
+<ParamField path="datasets" type="object[]" required>
+  A list of dataset configurations. Each object describes one dataset source. At least one entry is required when not using `pretraining_dataset`.
+
+  ```yaml
+  datasets:
+    - path: mhenrichsen/alpaca_data_cleaned
+      type: alpaca
+    - path: /local/data/custom.jsonl
+      type: chat_template
+      split: train
+  ```
+</ParamField>
+
+### Dataset entry fields
+
+<ParamField path="datasets[].path" type="string">
+  Source of the dataset. Can be:
+  - A HuggingFace dataset repo ID: `mhenrichsen/alpaca_data_cleaned`
+  - A local file path: `/data/train.jsonl`
+  - An S3 URI: `s3://bucket/data/`
+  - A GCS URI: `gs://bucket/data/`
+</ParamField>
+
+<ParamField path="datasets[].type" type="string">
+  The prompt strategy (dataset format) to apply. This determines how raw dataset rows are transformed into training tokens. Common values:
+
+  | Value | Use case |
+  |-------|----------|
+  | `alpaca` | Instruction/input/output format |
+  | `chat_template` | Multi-turn conversation using a chat template |
+  | `completion` | Plain text completion / pretraining |
+  | `input_output` | Simple input→output pairs |
+  | `dpo` | DPO preference pairs (chosen/rejected) |
+  | `kto` | KTO binary preference labels |
+</ParamField>
+
+<ParamField path="datasets[].split" type="string">
+  Which HuggingFace dataset split to load (e.g., `train`, `validation`, `test`). Defaults to `train`.
+</ParamField>
+
+<ParamField path="datasets[].name" type="string">
+  The HuggingFace dataset configuration name, for datasets that have multiple named subsets (e.g., `default`, `en`, etc.).
+</ParamField>
+
+<ParamField path="datasets[].data_files" type="string | string[]">
+  Explicit file paths within the dataset directory or repo. Useful when the dataset repo contains multiple files and you want to select specific ones.
+
+  ```yaml
+  datasets:
+    - path: /data/
+      data_files:
+        - train_shard1.jsonl
+        - train_shard2.jsonl
+      type: completion
+  ```
+</ParamField>
+
+<ParamField path="datasets[].ds_type" type="string">
+  Defines the file format when `path` points to a file. Examples: `json`, `jsonl`, `parquet`, `csv`, `arrow`. Axolotl infers this from the file extension in most cases.
+</ParamField>
+
+<ParamField path="datasets[].field" type="string">
+  For `completion`-type datasets only: the column name containing the text to train on. Defaults to `text`.
+</ParamField>
+
+<ParamField path="datasets[].field_messages" type="string">
+  For `chat_template`-type datasets: the column that holds the message list. Defaults to `messages`.
+</ParamField>
+
+<ParamField path="datasets[].chat_template" type="string">
+  Per-dataset chat template override. Applies only to this dataset entry. See the top-level `chat_template` field for supported values.
+</ParamField>
+
+<ParamField path="datasets[].shards" type="integer">
+  Split this dataset into N pieces for distributed or memory-constrained environments. Use together with `shards_idx`.
+</ParamField>
+
+<ParamField path="datasets[].shards_idx" type="integer">
+  Index of the shard to use when `shards` is set. Zero-indexed.
+</ParamField>
+
+## Validation split
+
+<ParamField path="val_set_size" type="float" default="0.0">
+  Fraction of the training dataset to hold out for evaluation. `0.0` disables evaluation. Use `1.0` for 100%, `0.05` for 5%, etc.
+
+  ```yaml
+  val_set_size: 0.05
+  ```
+
+  <Note>
+    You cannot use both `val_set_size` and `test_datasets` at the same time. Use one or the other.
+  </Note>
+</ParamField>
+
+<ParamField path="test_datasets" type="object[]">
+  An alternative to `val_set_size`. Specify one or more separate dataset entries to use exclusively for evaluation. Follows the same structure as `datasets`.
+
+  ```yaml
+  test_datasets:
+    - path: mhenrichsen/alpaca_data_cleaned
+      split: validation
+      type: alpaca
+  ```
+</ParamField>
+
+## Preprocessing and caching
+
+<ParamField path="dataset_prepared_path" type="string">
+  Local directory where the preprocessed (tokenized and packed) dataset is saved as an Arrow cache. On subsequent runs, Axolotl loads from this cache instead of re-tokenizing, which is much faster for large datasets.
+
+  ```yaml
+  dataset_prepared_path: ./data/prepared
+  ```
+
+  Set this path and run `axolotl preprocess config.yml` to populate it before training.
+</ParamField>
+
+<ParamField path="dataset_num_proc" type="integer">
+  Number of parallel processes to use for dataset preprocessing. Defaults to `os.cpu_count()`. On RunPod VMs, defaults to the number of vCPUs reported by `RUNPOD_CPU_COUNT`.
+
+  ```yaml
+  dataset_num_proc: 8
+  ```
+</ParamField>
+
+<ParamField path="dataset_keep_in_memory" type="boolean">
+  Keep the preprocessed dataset in RAM instead of memory-mapping. Only needed if your cached dataset files are taking too much storage and you prefer RAM usage.
+</ParamField>
+
+<ParamField path="dataset_exact_deduplication" type="boolean">
+  Deduplicate `datasets` and `test_datasets` by removing identical entries. Not compatible with streaming datasets or `skip_prepare_dataset`.
+</ParamField>
+
+<ParamField path="push_dataset_to_hub" type="string">
+  Push the prepared dataset to a HuggingFace Hub repo after preprocessing. Format: `org/repo-name`.
+</ParamField>
+
+## Shuffle and ordering
+
+<ParamField path="shuffle_merged_datasets" type="boolean" default="true">
+  Shuffle the combined dataset after merging all entries in `datasets`. Set to `false` to preserve dataset ordering, which is useful for curriculum learning or debugging.
+</ParamField>
+
+<ParamField path="shuffle_before_merging_datasets" type="boolean" default="false">
+  Shuffle each individual dataset before merging. Enables curriculum learning strategies at the per-dataset level.
+</ParamField>
+
+<ParamField path="seed" type="integer">
+  Global random seed for dataset shuffling and other stochastic operations. Set this for reproducibility.
+
+  ```yaml
+  seed: 42
+  ```
+</ParamField>
+
+## Streaming datasets
+
+<ParamField path="streaming" type="boolean">
+  Load datasets in streaming mode without downloading or caching. Useful for very large datasets that do not fit on disk. When enabled, `axolotl preprocess` is not applicable.
+
+  ```yaml
+  streaming: true
+  ```
+</ParamField>
+
+<ParamField path="streaming_multipack_buffer_size" type="integer" default="10000">
+  Buffer size (in number of samples) for multipack when using streaming datasets.
+</ParamField>
+
+## Sequence and epoch limits
+
+<ParamField path="max_steps" type="integer">
+  Maximum number of optimizer steps. Takes priority over `num_epochs`. If both are set, training stops at whichever limit is reached first.
+</ParamField>
+
+<ParamField path="num_epochs" type="float" default="1.0">
+  Number of full passes through the training dataset.
+</ParamField>
+
+## Example configs
+
+<Tabs>
+  <Tab title="HuggingFace dataset">
+    ```yaml
+    datasets:
+      - path: mhenrichsen/alpaca_data_cleaned
+        type: alpaca
+        split: train
+
+    val_set_size: 0.05
+    seed: 42
+    dataset_prepared_path: ./data/alpaca-prepared
+    dataset_num_proc: 8
+    ```
+  </Tab>
+  <Tab title="Local JSONL files">
+    ```yaml
+    datasets:
+      - path: /data/train/
+        data_files:
+          - part1.jsonl
+          - part2.jsonl
+        type: chat_template
+        ds_type: json
+
+    val_set_size: 0.02
+    dataset_num_proc: 4
+    ```
+  </Tab>
+  <Tab title="Multiple datasets">
+    ```yaml
+    datasets:
+      - path: mhenrichsen/alpaca_data_cleaned
+        type: alpaca
+        split: train
+      - path: HuggingFaceH4/ultrachat_200k
+        type: chat_template
+        split: train_sft
+
+    shuffle_merged_datasets: true
+    seed: 1337
+    val_set_size: 0.02
+    dataset_prepared_path: ./data/combined-prepared
+    ```
+  </Tab>
+  <Tab title="Streaming large dataset">
+    ```yaml
+    datasets:
+      - path: HuggingFaceFW/fineweb-edu
+        type: completion
+        split: train
+
+    streaming: true
+    max_steps: 10000
+    ```
+  </Tab>
+</Tabs>

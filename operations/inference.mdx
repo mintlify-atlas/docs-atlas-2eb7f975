@@ -1,0 +1,164 @@
+---
+title: "Running Inference with Axolotl"
+description: "Run interactive inference, launch a Gradio web UI, merge LoRA adapters into a base model, and evaluate your fine-tuned models using Axolotl."
+---
+
+After fine-tuning a model, you can use Axolotl to run inference interactively, launch a browser-based UI, or merge your adapter weights back into the base model for standalone deployment. All inference commands take the same config file you used for training, so tokenizer settings and special tokens stay consistent.
+
+## Basic inference
+
+<Tip>
+  Use the same config file for inference that you used during training. This ensures tokenization, special tokens, and prompt formatting match exactly.
+</Tip>
+
+Axolotl supports two common inference scenarios: LoRA models (where the adapter is kept separate from the base model) and full fine-tuned models (where the weights are already merged).
+
+<Tabs>
+  <Tab title="LoRA model">
+    ```bash
+    axolotl inference your_config.yml --lora-model-dir="./lora-output-dir"
+    ```
+  </Tab>
+  <Tab title="Full fine-tuned model">
+    ```bash
+    axolotl inference your_config.yml --base-model="./completed-model"
+    ```
+  </Tab>
+</Tabs>
+
+Both commands start an interactive CLI session where you can type prompts and receive completions.
+
+## Advanced usage
+
+### Gradio web interface
+
+To launch a browser-based chat UI instead of the interactive CLI, add the `--gradio` flag:
+
+```bash
+axolotl inference your_config.yml --gradio
+```
+
+This starts a local Gradio server. The URL is printed to your terminal once the model loads.
+
+### File-based prompts
+
+You can pipe prompts from a file to process them non-interactively:
+
+```bash
+cat /tmp/prompt.txt | axolotl inference your_config.yml \
+  --base-model="./completed-model" --prompter=None
+```
+
+### Memory optimization
+
+For large models or GPUs with limited VRAM, load the model in 8-bit precision:
+
+```bash
+axolotl inference your_config.yml --load-in-8bit=True
+```
+
+## Merging LoRA weights
+
+LoRA adapters must be merged back into the base model before deploying to serving infrastructure that does not support adapter loading. The `merge-lora` command handles this:
+
+```bash
+axolotl merge-lora your_config.yml --lora-model-dir="./completed-model"
+```
+
+The merged model is saved to `{output_dir}/merged`, where `output_dir` is the value from your config file.
+
+### Memory management during merging
+
+Merging loads both the base model and the adapter simultaneously, which can exceed available VRAM. Use the config options or CPU offload to work around this:
+
+<Tabs>
+  <Tab title="Config options">
+    ```yaml
+    gpu_memory_limit: 20GiB  # Adjust based on your GPU
+    lora_on_cpu: true        # Merge on CPU if needed
+    ```
+  </Tab>
+  <Tab title="Force CPU merging">
+    ```bash
+    CUDA_VISIBLE_DEVICES="" axolotl merge-lora your_config.yml \
+      --lora-model-dir="./completed-model"
+    ```
+
+    Setting `CUDA_VISIBLE_DEVICES=""` hides all GPUs, forcing the merge to run entirely on CPU. This is slower but avoids VRAM limits.
+  </Tab>
+</Tabs>
+
+## Evaluation
+
+To run the evaluation split from your dataset against the trained model:
+
+```bash
+axolotl evaluate your_config.yml
+```
+
+This uses the `eval_dataset` configured in your YAML and reports the evaluation loss.
+
+## Tokenization consistency
+
+Tokenization mismatches between training and inference are one of the most common sources of degraded output quality. Symptoms include incoherent responses, premature stopping, or the model ignoring your prompt format.
+
+<Warning>
+  Tokenization mismatches between training and inference are a common source of problems. Always use the same config file for both.
+</Warning>
+
+### Debugging tokenization
+
+<Steps>
+  <Step title="Inspect training tokenization">
+    Run the preprocessor with debug output to see exactly how your prompts are tokenized and which tokens have loss computed on them:
+
+    ```bash
+    axolotl preprocess your_config.yml --debug
+    ```
+  </Step>
+  <Step title="Verify inference tokenization">
+    Decode the tokens sent to the model before the forward pass to confirm the prompt matches what you intend. Compare token IDs between training and inference.
+  </Step>
+  <Step title="Compare token IDs">
+    If IDs differ between training and inference, the likely causes are a different tokenizer version, different special token configuration, or a different chat template.
+  </Step>
+</Steps>
+
+### Configuring special tokens
+
+Special tokens must match exactly between training and inference. Configure them in your YAML:
+
+```yaml
+special_tokens:
+  bos_token: "<s>"
+  eos_token: "</s>"
+  unk_token: "<unk>"
+tokens:
+  - "<|im_start|>"
+  - "<|im_end|>"
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Memory errors during inference or merging">
+    - Enable 8-bit loading with `--load-in-8bit=True`
+    - Set `lora_on_cpu: true` in your config to run the merge on CPU
+    - Force CPU-only merging with `CUDA_VISIBLE_DEVICES=""`
+    - Reduce batch size if running batched inference
+  </Accordion>
+  <Accordion title="Token or output quality issues">
+    - Verify special tokens in your config match what was used during training
+    - Check tokenizer settings — confirm the same tokenizer version is loaded
+    - Run `axolotl preprocess your_config.yml --debug` and inspect the token IDs
+    - Compare the tokenized prompt in inference against the training samples
+  </Accordion>
+  <Accordion title="Performance issues">
+    - Verify the model loaded correctly by checking the startup logs
+    - Check prompt formatting — ensure the chat template matches training
+    - Adjust temperature and sampling settings (`temperature`, `top_p`, `top_k`)
+    - For throughput-sensitive workloads, consider [vLLM serving](/operations/vllm-serving)
+  </Accordion>
+</AccordionGroup>
+
+For training-specific debugging (loss spikes, NaN gradients, OOM errors), see the [debugging guide](/operations/debugging).

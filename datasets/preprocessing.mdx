@@ -1,0 +1,196 @@
+---
+title: "Preprocessing Datasets for Faster Training"
+description: "Cache tokenized datasets with axolotl preprocess to eliminate re-tokenization overhead on repeated training runs and sweeps."
+---
+
+Dataset preprocessing is the step where Axolotl parses your raw data, applies the prompt strategy, tokenizes with the model's tokenizer, and (when using multiple datasets) shuffles and merges them. Running this step up front — and caching the result — removes significant overhead from every subsequent training run.
+
+---
+
+## Why preprocess ahead of time
+
+Every time you restart a training run without preprocessing, Axolotl re-tokenizes the entire dataset from scratch. For interactive tuning, hyperparameter sweeps, or any workflow where you restart training frequently, this adds up quickly.
+
+Preprocessing solves this by writing the tokenized dataset to disk. On the next run, Axolotl reads the cache instead of re-tokenizing.
+
+<Tip>
+Preprocessing can run on a CPU-only machine. You do not need to reserve GPU time for this step.
+</Tip>
+
+---
+
+## Running the preprocessor
+
+<Steps>
+  <Step title="Write your config">
+    Set `dataset_prepared_path` in your config to tell Axolotl where to store the tokenized cache.
+
+    ```yaml
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    datasets:
+      - path: my_dataset.jsonl
+        type: chat_template
+        roles_to_train: ["assistant"]
+    dataset_prepared_path: ./prepared_data
+    ```
+  </Step>
+  <Step title="Run the preprocess command">
+    ```bash
+    axolotl preprocess config.yaml
+    ```
+
+    Axolotl tokenizes all configured datasets and writes them to `dataset_prepared_path`. Subsequent `axolotl train config.yaml` calls will read from this cache.
+  </Step>
+  <Step title="Inspect the result (optional)">
+    Add `--debug` to print each tokenized sample with its label mask. This is the fastest way to verify that masking is applied correctly before committing to a full training run.
+
+    ```bash
+    axolotl preprocess config.yaml --debug
+    ```
+
+    The output format is `token(label, token_id)`. A label of `-100` means the token is masked and excluded from the loss.
+
+    Example output for a `chat_template` run with `roles_to_train: ["assistant"]`:
+
+    ```
+    <|im_start|>(-100, 128256) user(-100, 882)
+    (-100, 198) Hi(-100, 13347) <|im_end|>(-100, 128257)
+    (-100, 198) <|im_start|>(-100, 128256) assistant(-100, 78191)
+    (-100, 198) How(4438, 4438)  can(649, 649)  I(358, 358)  help(1520, 1520)  you(499, 499)?(30, 30) <|im_end|>(128257, 128257)
+    ```
+
+    User turns show `-100` labels (masked). Assistant turns show matching label and token ID (trained on).
+  </Step>
+</Steps>
+
+---
+
+## The `dataset_prepared_path` option
+
+This config key controls where the preprocessed cache is stored and whether it is reused.
+
+| Setting | Behavior |
+|---------|----------|
+| Not set (empty) | Cache is written to `./last_run_prepared/` but **ignored** on the next run. Each run re-tokenizes. |
+| Set to a path | Cache is written to that path and **reused** on subsequent runs when the path exists. |
+
+```yaml
+# Always re-tokenize (safe default for one-off runs)
+dataset_prepared_path:
+
+# Reuse cached data across runs (recommended for iterative work)
+dataset_prepared_path: ./last_run_prepared
+```
+
+<Note>
+The cache key is a hash of the dataset config and relevant training parameters. Axolotl will automatically re-preprocess if it detects a hash mismatch — for example, when you change the tokenizer, `sequence_len`, or dataset type.
+</Note>
+
+---
+
+## When to re-preprocess
+
+Axolotl detects most config changes automatically via its cache hash. However, some changes are invisible to the hash:
+
+<Warning>
+If you modify a **custom prompt template** or a **user-defined prompt strategy** defined outside of Axolotl's built-in formats, the hash will not change. You must manually clear `dataset_prepared_path` or point to a new directory before training.
+
+Failure to do so means you will train on the old prompt format even though your code has changed.
+</Warning>
+
+Re-preprocess whenever you:
+- Change your custom Jinja template or prompt strategy code
+- Add, remove, or change the content of dataset files
+- Change `sequence_len`, `tokenizer`, or `chat_template`
+- Change masking options (`roles_to_train`, `train_on_inputs`, etc.)
+
+---
+
+## Streaming datasets
+
+Streaming mode loads data incrementally during training rather than pre-tokenizing the full dataset. Use it when your dataset is too large to fit in memory (e.g. large pretraining corpora) or when you want to start training immediately.
+
+<Note>
+Streaming is incompatible with `axolotl preprocess`. Streaming datasets are tokenized on-the-fly during training.
+</Note>
+
+<Tabs>
+  <Tab title="Pretraining with streaming">
+    Use `pretraining_dataset` — streaming is automatic.
+
+    ```yaml
+    pretraining_dataset:
+      - path: HuggingFaceFW/fineweb-edu
+        type: pretrain
+        text_column: text
+        split: train
+
+    # Required: streaming cannot infer dataset length
+    max_steps: 10000
+
+    # Optional: pack multiple samples per sequence
+    sample_packing: true
+    streaming_multipack_buffer_size: 10000
+    ```
+  </Tab>
+  <Tab title="SFT with streaming">
+    Set `streaming: true` alongside your regular `datasets:` block.
+
+    ```yaml
+    streaming: true
+    datasets:
+      - path: tatsu-lab/alpaca
+        type: alpaca
+        split: train
+
+    # Optional: pack multiple samples per sequence
+    sample_packing: true
+    streaming_multipack_buffer_size: 10000
+    ```
+  </Tab>
+</Tabs>
+
+### Streaming configuration options
+
+| Option | Description |
+|--------|-------------|
+| `streaming_multipack_buffer_size` | Number of samples buffered before packing. Larger values improve packing efficiency at the cost of more memory. Default: `10000`. |
+| `shuffle_merged_datasets` | Shuffle the stream using the buffer. Requires additional memory. |
+| `pretrain_multipack_attn` | Prevent attention from crossing packed sample boundaries during pretraining. |
+
+### Streaming considerations
+
+- Evaluation datasets are **not** streamed — they are always loaded fully to ensure consistent metrics.
+- Streaming currently supports a **single dataset** only. Multi-dataset support is planned.
+- Streaming has slightly higher per-step latency than preprocessed datasets since tokenization happens on-the-fly.
+- Network bandwidth (for remote datasets) and disk read speed (for local datasets) are the primary bottlenecks.
+
+---
+
+## Choosing the right approach
+
+<CardGroup cols={2}>
+  <Card title="Use preprocessing when..." icon="database">
+    - Your dataset fits in memory
+    - You run training multiple times (sweeps, debugging)
+    - You want to inspect tokenization before training
+  </Card>
+  <Card title="Use streaming when..." icon="bolt">
+    - Your dataset is too large to fit in memory
+    - You're doing large-scale pretraining
+    - You want to start training without waiting for full preprocessing
+  </Card>
+</CardGroup>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Dataset formats" icon="table" href="/datasets/formats">
+    Choose the right format type for your data structure.
+  </Card>
+  <Card title="Loading datasets" icon="upload" href="/datasets/loading">
+    Load from local files, HuggingFace Hub, or cloud storage.
+  </Card>
+</CardGroup>

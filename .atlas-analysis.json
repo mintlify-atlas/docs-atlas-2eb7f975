@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Axolotl",
+  "projectType": "ai-ml",
+  "projectName": "Axolotl",
+  "projectDescription": "A free and open-source LLM fine-tuning framework that supports SFT, LoRA, QLoRA, DPO, GRPO, and more via a single YAML configuration file.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#cbe8d3",
-    "light": "#7ea39c",
-    "dark": "#141816"
-  },
-  "favicon": "https://media.brand.dev/3a59735e-02ef-4bbb-991e-2bdc23629621.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/axolotl-ai-cloud/axolotl"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/axolotl-ai-cloud/axolotl"
-    }
-  },
+  "primaryColor": "#cbe8d3",
+  "lightColor": "#7ea39c",
+  "darkColor": "#141816",
   "navigation": {
     "tabs": [
       {
@@ -96,5 +83,31 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "YAML-driven config for the full fine-tuning pipeline",
+    "SFT, LoRA, QLoRA, full fine-tuning support",
+    "Preference tuning: DPO, IPO, KTO, ORPO, GDPO",
+    "Reinforcement learning: GRPO, EBFT with vLLM async generation",
+    "Reward modelling and process reward modelling (PRM)",
+    "Multimodal/VLM fine-tuning (LLaMA-Vision, Qwen2-VL, Pixtral, Gemma, etc.)",
+    "Multi-GPU training via DeepSpeed, FSDP1, FSDP2",
+    "Multi-node training via Torchrun and Ray",
+    "Performance optimizations: Flash Attention, sample packing, LoRA optims",
+    "Flexible dataset loading from local, HuggingFace, S3, GCS, Azure, OCI",
+    "Docker images and PyPI packages for cloud and local hardware",
+    "Quantization Aware Training (QAT) and FP8 fine-tuning"
+  ],
+  "publicApiSurface": [
+    "axolotl train <config.yaml>",
+    "axolotl preprocess <config.yaml>",
+    "axolotl inference <config.yaml>",
+    "axolotl merge-lora <config.yaml>",
+    "axolotl vllm-serve <config.yaml>",
+    "axolotl fetch examples",
+    "axolotl agent-docs [topic]",
+    "axolotl config-schema",
+    "axolotl evaluate <config.yaml>",
+    "AxolotlInputConfig (Pydantic schema in src/axolotl/utils/schemas/config.py)"
+  ]
 }

@@ -1,0 +1,309 @@
+---
+title: "Choosing Your LLM Fine-Tuning Method"
+description: "A decision guide for picking between SFT, DPO, KTO, ORPO, GRPO, and reward modelling in Axolotl — with hardware requirements and config examples."
+keywords: ["axolotl", "sft", "dpo", "grpo", "kto", "orpo", "lora", "qlora", "fine-tuning method"]
+---
+
+Axolotl supports four broad categories of fine-tuning, each suited to different data types, objectives, and hardware constraints. This guide helps you identify the right method for your situation and configure it correctly.
+
+<Tip>
+  When in doubt, start with SFT. It is the most straightforward method and works well for most tasks. You can always move to preference learning or RL later to refine behavior.
+</Tip>
+
+## Quick decision guide
+
+Use this flowchart to identify your method. Start at the top and follow the path that fits your situation:
+
+```
+Do you have a reward function (code-based or model-based)?
+├── YES → Use GRPO (rl: grpo)
+│         Best for: math, code, reasoning, tasks with verifiable answers.
+│
+└── NO
+    │
+    Do you have preference pairs (chosen vs. rejected responses)?
+    ├── YES
+    │   │
+    │   Are they paired (same prompt, one chosen, one rejected)?
+    │   ├── YES → Use DPO (rl: dpo)
+    │   │         Direct optimization without a separate reward model.
+    │   │
+    │   └── NO (only binary good/bad labels, unpaired)
+    │       └── Use KTO (rl: kto)
+    │
+    └── NO
+        │
+        Do you have input-output examples?
+        ├── YES → Use SFT (no rl: key needed)
+        │         The simplest and most common method.
+        │
+        └── NO → You need to create training data first.
+                  Consider generating preference pairs with an LLM judge,
+                  or writing a reward function for GRPO.
+```
+
+## Method comparison
+
+| Criterion | SFT | DPO | KTO | GRPO |
+|-----------|-----|-----|-----|------|
+| Data complexity | Low (input-output pairs) | Medium (preference pairs) | Medium (binary labels) | Low (prompts + reward code) |
+| Compute cost | Low | Medium | Medium | High (requires vLLM server) |
+| Learning signal | Supervised | Contrastive | Contrastive | Online reward |
+| Online generation | No | No | No | Yes |
+| Reward model needed | No | No | No | No (uses reward functions) |
+| Best for | Task adaptation, instruction following | Safety, style alignment | Unpaired preference data | Reasoning, math, code |
+
+## Methods in detail
+
+### Supervised Fine-Tuning (SFT)
+
+SFT is the default method. You provide input-output pairs and the model learns to produce those outputs given those inputs. This is the starting point for most fine-tuning projects.
+
+**When to use**: instruction tuning, task-specific adaptation, conversation fine-tuning, or any time you have labeled input-output data.
+
+**Config key**: no `rl:` key needed — SFT is the default.
+
+```yaml SFT example
+base_model: NousResearch/Llama-3.2-1B
+
+adapter: lora
+load_in_8bit: true
+
+datasets:
+  - path: teknium/GPT4-LLM-Cleaned
+    type: alpaca
+
+output_dir: ./outputs/sft-out
+```
+
+---
+
+### DPO (Direct Preference Optimization)
+
+DPO trains the model to prefer chosen responses over rejected responses using paired preference data. It does not require a separate reward model.
+
+**When to use**: you have preference pairs from human feedback or an LLM judge — each sample has the same prompt with one chosen and one rejected response.
+
+**Config key**: `rl: dpo`
+
+```yaml DPO example
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+adapter: lora
+load_in_4bit: true
+
+rl: dpo
+
+datasets:
+  - path: Intel/orca_dpo_pairs
+    type: chatml.intel
+
+output_dir: ./outputs/dpo-out
+```
+
+<Note>
+  **IPO** (Identity Preference Optimization) is a regularized variant of DPO. Use `rl: ipo` to enable it. It can be more stable when DPO overfits.
+</Note>
+
+---
+
+### KTO (Kahneman-Tversky Optimization)
+
+KTO works with unpaired binary preference data — you label each response as "good" or "bad" without needing matching chosen/rejected pairs from the same prompt.
+
+**When to use**: you have a large collection of responses with binary quality labels but they are not paired by prompt.
+
+**Config key**: `rl: kto`
+
+```yaml KTO example
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+adapter: lora
+
+rl: kto
+
+datasets:
+  - path: your_kto_dataset
+    type: chatml.kto
+
+output_dir: ./outputs/kto-out
+```
+
+---
+
+### ORPO (Odds Ratio Preference Optimization)
+
+ORPO combines SFT and preference optimization into a single training stage. It does not require a separate reference model, which reduces memory usage and simplifies the training pipeline.
+
+**When to use**: you want preference alignment without a separate SFT step, or you want to reduce the number of training stages.
+
+**Config key**: `rl: orpo`
+
+```yaml ORPO example
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+adapter: lora
+
+rl: orpo
+
+datasets:
+  - path: your_preference_dataset
+    type: chatml.orpo
+
+output_dir: ./outputs/orpo-out
+```
+
+---
+
+### GRPO (Group Relative Policy Optimization)
+
+GRPO is an online RL method where the model generates its own completions and learns from a reward signal. It requires a vLLM server for generation and a reward function to score outputs.
+
+**When to use**: you have verifiable outcomes (math answers, code tests, structured outputs) and want the model to improve through trial and error rather than from static labeled data.
+
+**Config key**: `rl: grpo`
+
+```yaml GRPO example
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+adapter: lora
+
+rl: grpo
+
+datasets:
+  - path: your_prompt_dataset
+    type: chat_template
+    chat_template: llama3
+
+trl:
+  vllm_server_host: 0.0.0.0
+  vllm_server_port: 8000
+
+output_dir: ./outputs/grpo-out
+```
+
+<Warning>
+  GRPO requires a vLLM server running alongside the trainer. Plan for at least two GPUs for models 7B and larger — one for training, one for vLLM generation. For single-GPU setups, use `vllm_mode: colocate` with `vllm_enable_sleep_mode: true`.
+</Warning>
+
+---
+
+### Reward modelling
+
+Reward modelling trains a model to output a scalar reward score for a given response. The resulting model can be used as a reward function for GRPO or other RL methods.
+
+**When to use**: you want to train a custom reward model from preference data rather than use a code-based reward function.
+
+**Config key**: `rl: reward_trainer`
+
+```yaml Reward modelling example
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+rl: reward_trainer
+
+datasets:
+  - path: your_preference_dataset
+    type: chat_template
+
+output_dir: ./outputs/reward-model
+```
+
+## Adapter selection
+
+Once you have chosen a training method, decide how to apply parameter updates. All methods support LoRA, QLoRA, and full fine-tuning.
+
+<Tabs>
+  <Tab title="QLoRA">
+    The base model is loaded in 4-bit (NF4) quantization. Small low-rank adapter matrices are trained in higher precision on top. Provides roughly 4x VRAM reduction compared to full fine-tuning.
+
+    **Best for**: when your GPU cannot fit the model in full precision, or when you want fast experimentation.
+
+    ```yaml QLoRA config
+    adapter: qlora
+    load_in_4bit: true
+    lora_r: 32
+    lora_alpha: 64
+    lora_target_linear: true
+    ```
+  </Tab>
+
+  <Tab title="LoRA">
+    The base model is loaded at full precision (or 8-bit). Low-rank adapter matrices are trained alongside. Provides roughly 2-3x VRAM reduction compared to full fine-tuning.
+
+    **Best for**: when you have enough VRAM for the base model but not for full optimizer states. Quality is very close to full fine-tuning for most tasks.
+
+    ```yaml LoRA config
+    adapter: lora
+    lora_r: 32
+    lora_alpha: 64
+    lora_target_linear: true
+    ```
+
+    <Tip>
+      For GRPO training, LoRA is strongly recommended. The vLLM server needs to sync weights from the trainer, and LoRA sync is far more efficient than syncing full merged weights.
+    </Tip>
+  </Tab>
+
+  <Tab title="Full fine-tuning">
+    All model parameters are updated. No adapters. Requires memory for model weights, gradients, and optimizer states (roughly 4x model size in bf16 with AdamW).
+
+    **Best for**: when you have ample GPU memory or multi-GPU setups, and need maximum performance. Also required for pre-training.
+
+    ```yaml Full fine-tuning config
+    # No adapter or load_in_* lines needed
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+    ```
+  </Tab>
+</Tabs>
+
+### Adapter comparison
+
+| | QLoRA | LoRA | Full |
+|---|---|---|---|
+| Trainable params | ~0.1-1% | ~0.1-1% | 100% |
+| Model memory | ~25% of full | ~50-100% of full | 100% |
+| Optimizer memory | Tiny (adapters only) | Tiny (adapters only) | 2x model size (AdamW) |
+| Training speed | Slower (dequantization overhead) | Baseline | Faster per step |
+| Inference | Merge or serve with adapter | Merge or serve with adapter | Direct |
+| Multi-GPU required? | Rarely | For 13B+ models | For 7B+ models |
+
+## Hardware requirements
+
+These are approximate VRAM requirements at short context lengths (512–2048 tokens) with `micro_batch_size: 1-2`.
+
+### SFT and preference learning
+
+| Model size | QLoRA (4-bit) | LoRA (bf16) | Full (bf16 + AdamW) |
+|------------|--------------|-------------|---------------------|
+| 1-3B | 6-8 GB | 8-12 GB | 24-32 GB |
+| 7-8B | 10-14 GB | 16-24 GB | 60-80 GB |
+| 13-14B | 16-20 GB | 28-40 GB | 120+ GB |
+| 30-34B | 24-32 GB | 64-80 GB | 2-4× 80 GB |
+| 70-72B | 40-48 GB | 2× 80 GB | 4-8× 80 GB |
+
+<Note>
+  Longer sequences and larger batches increase memory significantly due to activations. Use gradient checkpointing to reduce activation memory at the cost of ~30% slower training.
+</Note>
+
+### GRPO
+
+GRPO requires additional GPU(s) for the vLLM generation server.
+
+| Model size | Training GPU (LoRA, bf16) | vLLM GPU | Total |
+|------------|--------------------------|----------|-------|
+| 0.5-3B | 1× 24 GB | 1× 24 GB | 2× 24 GB |
+| 7-8B | 1× 80 GB | 1× 80 GB | 2× 80 GB |
+| 13-14B | 1-2× 80 GB | 1-2× 80 GB | 2-4× 80 GB |
+| 30-72B | 2-4× 80 GB | 2-4× 80 GB | 4-8× 80 GB |
+
+## Quick reference
+
+| Method | Config key | Documentation | Example |
+|--------|-----------|---------------|---------|
+| SFT | *(no `rl:` key)* | [Quickstart](/quickstart) | `examples/llama-3/lora-1b.yml` |
+| DPO | `rl: dpo` | [Preference tuning](/training/preference-tuning) | See preference-tuning docs |
+| KTO | `rl: kto` | [Preference tuning](/training/preference-tuning) | See preference-tuning docs |
+| ORPO | `rl: orpo` | [Preference tuning](/training/preference-tuning) | See preference-tuning docs |
+| GRPO | `rl: grpo` | [GRPO](/training/grpo) | See GRPO docs |
+| Reward modelling | `rl: reward_trainer` | [Reward modelling](/training/reward-modelling) | See reward-modelling docs |

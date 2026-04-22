@@ -1,0 +1,177 @@
+---
+title: "Model Configuration Options in Axolotl"
+description: "Reference for all model-related YAML fields in Axolotl: base model path, tokenizer, precision (bf16/fp16), attention implementations, and dtype settings."
+---
+
+The model section of your config controls which pretrained weights to load, how to load them, and what hardware optimizations to apply. These settings are validated by `ModelInputConfig` in `src/axolotl/utils/schemas/model.py` and the top-level `AxolotlInputConfig`.
+
+## Base model
+
+<ParamField path="base_model" type="string" required>
+  HuggingFace model ID or local path to a directory containing `*.safetensors`, `*.pt`, or `*.bin` files. This is the only required field in the entire config.
+
+  ```yaml
+  base_model: meta-llama/Llama-3.1-8B-Instruct
+  # or a local path:
+  base_model: /mnt/models/my-model
+  ```
+</ParamField>
+
+<ParamField path="base_model_config" type="string">
+  If the HuggingFace repository does not include configuration JSON files, point to a separate repo or path that does. Defaults to the value of `base_model`.
+</ParamField>
+
+<ParamField path="model_type" type="string">
+  The transformers model class to instantiate, for example `AutoModelForCausalLM`. Axolotl defaults to `AutoModelForCausalLM` for most use cases; set this only if you need a specific class like `MistralForCausalLM`.
+</ParamField>
+
+<ParamField path="cls_model_config" type="string">
+  transformers config class to use when loading the model configuration (e.g., `LlamaConfig`, `MistralConfig`). Defaults to `AutoConfig`.
+</ParamField>
+
+## Tokenizer
+
+<ParamField path="tokenizer_type" type="string">
+  Tokenizer class to use. Defaults to `AutoTokenizer`. Override only if you need a specific tokenizer class (e.g., for models that ship a custom tokenizer).
+</ParamField>
+
+<ParamField path="tokenizer_config" type="string">
+  Path or HuggingFace repo to load the tokenizer from, if different from `base_model`.
+</ParamField>
+
+<ParamField path="tokenizer_use_fast" type="boolean">
+  Whether to use the fast (Rust-based) tokenizer. Defaults to `true`. Set to `false` if you encounter issues with specific models.
+</ParamField>
+
+<ParamField path="tokenizer_legacy" type="boolean">
+  Whether to use the legacy tokenizer behavior. Defaults to `true`.
+</ParamField>
+
+<ParamField path="trust_remote_code" type="boolean" default="false">
+  Allow execution of remote code when loading the model and tokenizer from HuggingFace Hub. Required for models with custom model implementations (e.g., some Falcon variants).
+
+  <Warning>
+    Only set `trust_remote_code: true` after reviewing the model code. Axolotl will print a warning when this is enabled.
+  </Warning>
+</ParamField>
+
+## Quantization for loading
+
+These options control how the model weights are loaded into memory. They are distinct from training precision and are most useful when training with LoRA/QLoRA adapters.
+
+<ParamField path="load_in_8bit" type="boolean" default="false">
+  Load the model in 8-bit precision using bitsandbytes. Reduces VRAM usage significantly. Requires `adapter: lora` or `adapter: qlora`.
+
+  ```yaml
+  load_in_8bit: true
+  adapter: lora
+  ```
+</ParamField>
+
+<ParamField path="load_in_4bit" type="boolean" default="false">
+  Load model weights in 4-bit NormalFloat (NF4) quantization using bitsandbytes. Required when `adapter: qlora`. Cannot be combined with `load_in_8bit`.
+
+  ```yaml
+  load_in_4bit: true
+  adapter: qlora
+  ```
+</ParamField>
+
+## Training precision
+
+<ParamField path="bf16" type="boolean | string" default="auto">
+  Enable bfloat16 mixed precision training. Set to `true`, `false`, or `"auto"` (default) to detect hardware capability automatically. Requires Ampere or newer GPU (A100, H100, RTX 3000+).
+</ParamField>
+
+<ParamField path="fp16" type="boolean">
+  Enable float16 mixed precision training. Use on older GPUs that do not support bf16. Cannot be combined with `bf16: true`.
+</ParamField>
+
+<ParamField path="tf32" type="boolean | string" default="auto">
+  Enable TF32 matrix multiplication for faster training on Ampere and newer hardware. `"auto"` (default) enables it when supported. Does not change the storage precision of weights.
+</ParamField>
+
+<ParamField path="fp8" type="boolean">
+  Enable FP8 mixed-precision training using TorchAO. Best combined with `torch_compile: true`. Requires supported hardware (H100, H200) and `ms-amp`, `transformer-engine`, or `torchao`.
+</ParamField>
+
+<ParamField path="torch_dtype" type="string">
+  Explicit dtype passed to `from_pretrained`, for example `bfloat16` or `float16`. In most cases, `bf16`/`fp16` controls this automatically.
+</ParamField>
+
+## Attention implementations
+
+Axolotl supports several attention backends. Only enable one at a time.
+
+<ParamField path="flash_attention" type="boolean">
+  Use Flash Attention 2 for faster and more memory-efficient attention. Requires the `flash-attn` package. Recommended for most training runs on modern GPUs.
+
+  ```yaml
+  flash_attention: true
+  ```
+</ParamField>
+
+<ParamField path="sdp_attention" type="boolean">
+  Use PyTorch's built-in scaled dot product attention (`torch.nn.functional.scaled_dot_product_attention`). Available without additional packages. Note: combining with `sample_packing` and `bf16` on non-H100 GPUs can cause loss to collapse to 0.
+</ParamField>
+
+<ParamField path="flex_attention" type="boolean">
+  Use PyTorch FlexAttention (requires torch >= 2.6.0). Enables custom attention masks for advanced use cases.
+</ParamField>
+
+<ParamField path="xformers_attention" type="boolean">
+  Use xFormers memory-efficient attention. Requires the `xformers` package. Less commonly used than `flash_attention`.
+</ParamField>
+
+<ParamField path="sage_attention" type="boolean">
+  Use SageAttention for compute efficiency. Requires compute capability sm_80–sm_120 (A100, A10, RTX 3000+, H100). Requires `pad_to_sequence_len: true` when not using sample packing.
+
+  <Warning>
+    SageAttention with full fine-tuning can cause loss to drop to 0. Monitor your loss carefully and prefer LoRA/QLoRA or an alternative attention method.
+  </Warning>
+</ParamField>
+
+<ParamField path="attn_implementation" type="string">
+  Manually specify an attention implementation string passed to `from_pretrained`. Used for custom kernels where the standard flags are insufficient.
+</ParamField>
+
+## Compilation
+
+<ParamField path="torch_compile" type="boolean | string" default="null">
+  Enable `torch.compile` for graph compilation. Set to `true`, `false`, or `"auto"` which enables compile when torch >= 2.5.1. Can significantly improve throughput on supported hardware.
+</ParamField>
+
+<ParamField path="torch_compile_backend" type="string">
+  Backend to use for `torch.compile` (e.g., `inductor`, `cudagraphs`). Defaults to `inductor`.
+</ParamField>
+
+## Example configs
+
+<Tabs>
+  <Tab title="Standard BF16">
+    ```yaml
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    bf16: true
+    tf32: true
+    flash_attention: true
+    ```
+  </Tab>
+  <Tab title="4-bit QLoRA">
+    ```yaml
+    base_model: meta-llama/Llama-3.1-70B-Instruct
+    load_in_4bit: true
+    adapter: qlora
+    bf16: true
+    flash_attention: true
+    ```
+  </Tab>
+  <Tab title="Custom model class">
+    ```yaml
+    base_model: /local/path/to/model
+    model_type: AutoModelForCausalLM
+    tokenizer_type: AutoTokenizer
+    trust_remote_code: true
+    bf16: auto
+    ```
+  </Tab>
+</Tabs>

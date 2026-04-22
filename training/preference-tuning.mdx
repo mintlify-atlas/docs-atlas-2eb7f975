@@ -1,0 +1,419 @@
+---
+title: "Preference Tuning: DPO, KTO, ORPO, and More"
+description: "Align language models using human preference data with DPO, IPO, KTO, ORPO, GDPO, and SimPO. Covers dataset formats and when to use each method."
+---
+
+Preference tuning methods align a language model's outputs with human preferences without relying on an explicit reward model or online rollouts. Axolotl integrates with TRL to expose these methods through a single `rl:` config key. Each method has its own dataset format requirements and trade-offs in terms of what data you need and what properties the training algorithm optimizes.
+
+<Note>
+Preference tuning in Axolotl is a beta feature. Many advanced options are not yet fully implemented. Contributions are welcome via pull request.
+</Note>
+
+## Choosing a method
+
+<CardGroup cols={2}>
+  <Card title="DPO / IPO" icon="arrow-left-right">
+    You have paired preference data — each example has a chosen and a rejected completion for the same prompt.
+  </Card>
+  <Card title="KTO" icon="binary">
+    You have unpaired binary labels — each completion is marked as desirable or undesirable, but you don't need pairs.
+  </Card>
+  <Card title="ORPO" icon="merge">
+    You want single-stage alignment without a reference model. Slightly simpler setup than DPO.
+  </Card>
+  <Card title="GDPO" icon="chart-bar">
+    You are training with multiple reward functions and want to prevent reward advantage collapse.
+  </Card>
+</CardGroup>
+
+## DPO
+
+Direct Preference Optimization (DPO) trains the model directly on paired chosen/rejected completions, without a separate reward model. The model learns to assign higher probability to the chosen response relative to the rejected one.
+
+**When to use:** You have a dataset of (prompt, chosen, rejected) triples — for example, collected via human annotation or distilled from a stronger model.
+
+```yaml dpo-config.yml
+rl: dpo
+
+datasets:
+  - path: Intel/orca_dpo_pairs
+    split: train
+    type: chatml.intel
+  - path: argilla/ultrafeedback-binarized-preferences
+    split: train
+    type: chatml
+```
+
+### DPO dataset formats
+
+DPO supports many format variants. Select the `type` that matches your dataset schema.
+
+<AccordionGroup>
+  <Accordion title="chatml.intel">
+    ```json
+    {
+      "system": "...",
+      "question": "...",
+      "chosen": "...",
+      "rejected": "..."
+    }
+    ```
+  </Accordion>
+  <Accordion title="chatml.prompt_pairs">
+    ```json
+    {
+      "system": "...",
+      "prompt": "...",
+      "chosen": "...",
+      "rejected": "..."
+    }
+    ```
+  </Accordion>
+  <Accordion title="chatml.argilla">
+    ```json
+    {
+      "system": "...",
+      "instruction": "...",
+      "chosen_response": "...",
+      "rejected_response": "..."
+    }
+    ```
+  </Accordion>
+  <Accordion title="chatml.argilla_chat">
+    ```json
+    {
+      "chosen": [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."}
+      ],
+      "rejected": [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."}
+      ]
+    }
+    ```
+  </Accordion>
+  <Accordion title="chatml.ultra">
+    ```json
+    {
+      "system": "...",
+      "prompt": "...",
+      "chosen": [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."}
+      ],
+      "rejected": [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."}
+      ]
+    }
+    ```
+  </Accordion>
+  <Accordion title="chat_template.default (flexible)">
+    The most flexible format — map arbitrary field names to DPO components:
+
+    ```yaml
+    rl: dpo
+    datasets:
+      - path: your/dataset
+        split: train
+        type: chat_template.default
+        field_messages: "messages"
+        field_chosen: "chosen"
+        field_rejected: "rejected"
+        message_property_mappings:
+          role: role
+          content: content
+        roles:
+          user: ["user"]
+          assistant: ["assistant"]
+          system: ["system"]
+    ```
+
+    Expected row format:
+
+    ```json
+    {
+      "messages": [
+        {"role": "system", "content": "..."},
+        {"role": "user", "content": "..."}
+      ],
+      "chosen": {"role": "assistant", "content": "..."},
+      "rejected": {"role": "assistant", "content": "..."}
+    }
+    ```
+  </Accordion>
+  <Accordion title="user_defined.default (fully custom)">
+    Specify field names and format strings for complete control:
+
+    ```yaml
+    rl: dpo
+    datasets:
+      - path: your/dataset
+        split: train
+        type:
+          field_prompt: "prompt"
+          field_system: "system"
+          field_chosen: "chosen"
+          field_rejected: "rejected"
+          prompt_format: "{prompt}"
+          chosen_format: "{chosen}"
+          rejected_format: "{rejected}"
+    ```
+
+    ```json
+    {
+      "system": "...",
+      "prompt": "...",
+      "chosen": "...",
+      "rejected": "..."
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+Find all supported prompt strategies for DPO (and other methods) in `src/axolotl/prompt_strategies/dpo/`. The `type` value maps to `{method}.{function_name}`.
+</Tip>
+
+## IPO
+
+Identity Preference Optimization (IPO) uses the same dataset formats as DPO but applies a different loss function that avoids overfitting to the preference data. Replace `rl: dpo` with `rl: ipo`:
+
+```yaml ipo-config.yml
+rl: ipo
+
+datasets:
+  - path: Intel/orca_dpo_pairs
+    split: train
+    type: chatml.intel
+```
+
+All DPO dataset format types listed above are also valid for IPO.
+
+## KTO
+
+Kahneman-Tversky Optimization (KTO) works with unpaired binary preference labels: each example is a single (prompt, completion) pair with a boolean label indicating whether the completion was desirable. This is useful when you have feedback that was collected one example at a time rather than as paired comparisons.
+
+**When to use:** You have binary human feedback (thumbs up / thumbs down) without matched pairs.
+
+```yaml kto-config.yml
+rl: kto
+rl_beta: 0.1
+kto_desirable_weight: 1.0
+kto_undesirable_weight: 1.0
+
+remove_unused_columns: false
+
+datasets:
+  - path: argilla/ultrafeedback-binarized-preferences-cleaned-kto
+    type: llama3.ultra
+    split: train
+
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: true
+```
+
+### KTO dataset formats
+
+KTO formats differ from DPO — each row contains a single completion rather than a chosen/rejected pair.
+
+<AccordionGroup>
+  <Accordion title="llama3.ultra / chatml.ultra">
+    ```json
+    {
+      "system": "...",
+      "prompt": "...",
+      "completion": "..."
+    }
+    ```
+  </Accordion>
+  <Accordion title="llama3.intel / chatml.intel">
+    ```json
+    {
+      "system": "...",
+      "question": "...",
+      "completion": "..."
+    }
+    ```
+  </Accordion>
+  <Accordion title="chatml.argilla_chat">
+    ```json
+    {
+      "chosen": [
+        {"role": "user", "content": "..."}
+      ],
+      "completion": [
+        {"role": "assistant", "content": "..."}
+      ]
+    }
+    ```
+  </Accordion>
+  <Accordion title="user_defined.default">
+    ```yaml
+    rl: kto
+    datasets:
+      - path: your/dataset
+        split: train
+        type:
+          field_prompt: "prompt"
+          field_system: "system"
+          field_completion: "completion"
+          field_label: "label"
+          prompt_format: "{prompt}"
+          completion_format: "{completion}"
+    ```
+
+    ```json
+    {
+      "system": "...",
+      "prompt": "...",
+      "completion": "...",
+      "label": true
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## ORPO
+
+Odds Ratio Preference Optimization (ORPO) combines supervised fine-tuning and preference alignment into a single training stage. It does not require a reference model, which simplifies the setup and reduces memory usage.
+
+**When to use:** You want a single-stage alignment training run and have paired chosen/rejected data.
+
+```yaml orpo-config.yml
+rl: orpo
+orpo_alpha: 0.1
+remove_unused_columns: false
+
+chat_template: chatml
+datasets:
+  - path: argilla/ultrafeedback-binarized-preferences-cleaned
+    type: chat_template.argilla
+```
+
+### ORPO dataset format
+
+ORPO uses the `chat_template.argilla` format. The chosen and rejected sequences must share the same prefix up to the last assistant turn:
+
+```json
+{
+  "system": "...",
+  "prompt": "...",
+  "chosen": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "rejected": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+## GDPO
+
+Group Reward-Decoupled Policy Optimization (GDPO) extends GRPO for training with multiple reward functions. It addresses **reward advantage collapse**: when rewards are summed before normalization, different reward combinations can produce identical group-relative advantages, masking learning signal.
+
+**When to use:** You are running GRPO with multiple reward functions and want each reward to contribute independently to training.
+
+```yaml gdpo-config.yml
+base_model: Qwen/Qwen2.5-1.5B-Instruct
+
+vllm:
+  host: 0.0.0.0
+  port: 8000
+  tensor_parallel_size: 2
+  gpu_memory_utilization: 0.85
+
+rl: gdpo
+
+trl:
+  beta: 0.001
+  max_completion_length: 256
+  use_vllm: true
+  num_generations: 4
+  reward_funcs:
+    - rewards.format_reward
+    - rewards.correctness_reward
+  reward_weights: [1.0, 2.0]
+
+datasets:
+  - path: openai/gsm8k
+    name: main
+    type: rewards.oai_gsm8k_transform
+```
+
+### GDPO vs GRPO aggregation
+
+| Aspect | GRPO | GDPO |
+|--------|------|------|
+| Aggregation | `sum_then_normalize` | `normalize_then_sum` |
+| Multi-reward | May collapse advantages | Preserves per-reward signal |
+| Single reward | Standard behavior | Equivalent to GRPO |
+
+You can also use GRPO with explicit aggregation control instead of `rl: gdpo`:
+
+```yaml
+rl: grpo
+trl:
+  multi_objective_aggregation: normalize_then_sum  # same as GDPO
+```
+
+GDPO also supports sequence parallelism for long-context training:
+
+```yaml
+rl: gdpo
+context_parallel_size: 2
+```
+
+## SimPO
+
+SimPO uses the CPO (Contrastive Policy Optimization) trainer with an alternative loss function. It uses the same dataset format as DPO.
+
+```yaml simpo-config.yml
+rl: simpo
+rl_beta: 0.1
+cpo_alpha: 1.0
+simpo_gamma: 0.5
+```
+
+## Using local dataset files
+
+All preference tuning methods support loading data from local JSONL files:
+
+```yaml
+datasets:
+  - ds_type: json
+    data_files:
+      - orca_rlhf.jsonl
+    split: train
+    type: chatml.intel
+```
+
+## Memory optimization with PEFT
+
+When using a LoRA adapter (`adapter: lora`), TRL automatically uses the adapter as an implicit reference model by toggling the adapter on/off. This avoids loading a separate copy of the base model:
+
+```yaml
+adapter: lora
+# TRL auto-unwraps PEFT — no separate reference model needed
+```
+
+To load an explicit reference model instead (for debugging or specific use cases):
+
+```yaml
+rl_adapter_ref_model: true
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="GRPO" icon="trophy" href="/training/grpo">
+    RL training with online rollouts and custom reward functions.
+  </Card>
+  <Card title="Reward modelling" icon="star" href="/training/reward-modelling">
+    Train outcome and process reward models to use as reward signals.
+  </Card>
+</CardGroup>

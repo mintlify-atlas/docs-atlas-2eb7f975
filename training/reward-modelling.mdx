@@ -1,0 +1,133 @@
+---
+title: "Reward Modelling and Process Reward Models"
+description: "Train outcome reward models and process reward models in Axolotl to produce reward signals for GRPO or standalone preference evaluation tasks."
+---
+
+Reward models are used to predict the quality of language model outputs — providing the reward signal that drives reinforcement learning methods like GRPO. Axolotl supports two categories of reward model: outcome reward models (ORMs), which score a full interaction, and process reward models (PRMs), which score each step of a reasoning trace.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Outcome Reward Models (ORM)" icon="check-circle">
+    Score the final output of an interaction. Trained on preference annotations for complete responses. Use with `reward_model: true`.
+  </Card>
+  <Card title="Process Reward Models (PRM)" icon="list-ordered">
+    Score each reasoning step independently. Trained on stepwise annotations of reasoning traces. Use with `process_reward_model: true`.
+  </Card>
+</CardGroup>
+
+Both model types are backed by TRL's reward training infrastructure and follow Axolotl's standard config-driven training workflow.
+
+## Outcome reward models
+
+An outcome reward model (ORM) is trained using preference data that covers the full interaction between a user and model — for example, a chosen response and a rejected response for the same prompt. The model learns to output a scalar score predicting which response a human would prefer.
+
+ORMs are loaded as sequence classification models (`AutoModelForSequenceClassification`) with `num_labels: 1`.
+
+```yaml orm-config.yml
+base_model: google/gemma-2-2b
+model_type: AutoModelForSequenceClassification
+num_labels: 1
+tokenizer_type: AutoTokenizer
+
+reward_model: true
+chat_template: gemma
+datasets:
+  - path: argilla/distilabel-intel-orca-dpo-pairs
+    type: bradley_terry.chat_template
+
+val_set_size: 0.1
+eval_steps: 100
+```
+
+<Tip>
+Set `center_rewards_coefficient` to encourage mean-zero reward outputs, which improves training stability. See the [TRL reward trainer docs](https://huggingface.co/docs/trl/v0.10.1/en/reward_trainer#centering-rewards) for details.
+</Tip>
+
+### Dataset format for ORMs
+
+The `bradley_terry.chat_template` format expects single-turn conversations with chosen and rejected responses:
+
+```json
+{
+  "system": "...",
+  "input": "...",
+  "chosen": "...",
+  "rejected": "..."
+}
+```
+
+## Process reward models
+
+Process reward models (PRMs) provide fine-grained reward signals by scoring each step in a sequence of reasoning steps. PRMs are commonly trained on annotated math reasoning traces (e.g., step-by-step solutions) and used as reward signals for downstream RL training.
+
+PRMs are loaded as token classification models (`AutoModelForTokenClassification`) with `num_labels: 2` (correct / incorrect per step).
+
+```yaml prm-config.yml
+base_model: Qwen/Qwen2.5-3B
+model_type: AutoModelForTokenClassification
+num_labels: 2
+
+process_reward_model: true
+datasets:
+  - path: trl-lib/math_shepherd
+    type: stepwise_supervised
+    split: train
+
+val_set_size: 0.1
+eval_steps: 100
+```
+
+<Note>
+The `stepwise_supervised` dataset type is specific to process reward model training. See the [stepwise_supervised dataset format](/datasets/formats) documentation for details on the expected schema.
+</Note>
+
+## Training reward models
+
+Reward models are trained using the same `axolotl train` command as any other training run:
+
+```bash
+axolotl train orm-config.yml    # Outcome reward model
+axolotl train prm-config.yml    # Process reward model
+```
+
+Standard training options such as `micro_batch_size`, `learning_rate`, `num_epochs`, and `output_dir` apply as usual.
+
+<Tip>
+Preprocess large datasets before training to avoid tokenization overhead at training time:
+
+```bash
+axolotl preprocess orm-config.yml
+```
+</Tip>
+
+## Using reward models in GRPO
+
+Once trained, a reward model can be used as a reward function in GRPO training by passing its HuggingFace model path (or local directory) as a `reward_funcs` entry. TRL loads it and uses its scalar output as the reward:
+
+```yaml grpo-with-reward-model.yml
+rl: grpo
+
+trl:
+  reward_funcs:
+    - ./outputs/my-orm/merged        # Local trained ORM
+    - rewards.format_reward          # Additional Python reward function
+  reward_weights:
+    - 1.0
+    - 0.3
+```
+
+<Tip>
+Combine a trained ORM with lightweight Python reward functions (e.g., format checking) to get both learned preference signals and verifiable correctness signals in a single GRPO run.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="GRPO" icon="trophy" href="/training/grpo">
+    Use your reward model as a reward signal in online RL training.
+  </Card>
+  <Card title="Preference tuning" icon="thumbs-up" href="/training/preference-tuning">
+    Offline alignment with DPO, KTO, and ORPO — no reward model needed.
+  </Card>
+</CardGroup>

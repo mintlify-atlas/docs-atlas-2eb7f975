@@ -1,0 +1,538 @@
+---
+title: "GRPO: Reinforcement Learning for LLMs"
+description: "Train language models with Group Relative Policy Optimization using custom reward functions, async vLLM generation, and FSDP or DeepSpeed for multi-GPU scaling."
+---
+
+Group Relative Policy Optimization (GRPO) is a reinforcement learning method that improves language models by generating multiple completions per prompt, scoring them with reward functions, and using their relative ranking within each group to compute advantage estimates. Unlike DPO — which requires pre-collected preference pairs — GRPO generates its own training data online and can work with any programmatic reward signal: math correctness, format compliance, code execution results, and more.
+
+Use GRPO when you have a task with a verifiable reward signal and want the model to discover solution strategies on its own. Use DPO when you already have human preference data. Use SFT when you have gold-standard completions to imitate directly.
+
+## Architecture
+
+GRPO uses a two-process setup: a vLLM server handles fast generation, while a separate trainer process scores completions and applies gradient updates.
+
+```
+Terminal 1 (GPU 0)                    Terminal 2 (GPU 1)
+┌──────────────────────┐              ┌──────────────────────────────────┐
+│  vLLM Server         │              │  Trainer                         │
+│                      │   HTTP       │                                  │
+│  Serves base model   │◄────────────►│  Background thread:              │
+│  + LoRA adapter      │  /generate   │    Send prompts to vLLM          │
+│                      │  /set_lora   │    Pad & collate completions     │
+│  Punica kernels for  │              │                                  │
+│  LoRA inference      │              │  Main thread:                    │
+│                      │              │    Score completions (rewards)   │
+└──────────────────────┘              │    Compute policy log-probs      │
+                                      │    Calculate advantages          │
+                                      │    PPO-clip gradient update      │
+                                      │    Sync LoRA weights to vLLM     │
+                                      └──────────────────────────────────┘
+```
+
+**Data flow for each training step:**
+
+1. The background thread sends prompts to vLLM, which generates `num_generations` completions per prompt.
+2. The main thread scores completions using your reward functions.
+3. Advantages are computed within each prompt group (group-relative normalization).
+4. Policy log-probabilities are computed via a forward pass on the training model.
+5. The PPO-clip loss is computed and gradients are applied.
+6. Periodically, LoRA adapter weights are synced back to vLLM so future generations reflect the updated policy.
+
+With async prefetch enabled, step 1 for the *next* batch runs concurrently with steps 2–6 for the *current* batch.
+
+## Quick start
+
+A GRPO training run requires three components: a YAML config, a reward module, and a running vLLM server.
+
+<Steps>
+  <Step title="Write a reward module">
+    Create `rewards.py` in your working directory. Reward functions receive a list of completions and return a list of floats:
+
+    ```python rewards.py
+    import re
+
+
+    def accuracy_reward(completions, answer, **kwargs) -> list[float]:
+        """Check if the completion contains the correct numerical answer."""
+        rewards = []
+        for completion, correct in zip(completions, answer):
+            text = completion[0]["content"]
+            numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
+            predicted = numbers[-1] if numbers else ""
+            rewards.append(1.0 if predicted == str(correct) else 0.0)
+        return rewards
+
+
+    def format_reward(completions, **kwargs) -> list[float]:
+        """Reward completions that use a structured thinking format."""
+        rewards = []
+        for completion in completions:
+            text = completion[0]["content"]
+            has_think = "<think>" in text and "</think>" in text
+            has_answer = "<answer>" in text and "</answer>" in text
+            rewards.append(1.0 if has_think and has_answer else 0.0)
+        return rewards
+
+
+    def prompt_transform(cfg, *args, **kwargs):
+        """Convert GSM8K dataset rows into chat prompts."""
+        def transform_fn(example, tokenizer=None):
+            label = example["answer"].split("####")[-1].strip().replace(",", "")
+            return {
+                "prompt": [
+                    {"role": "system", "content": "Solve the math problem. Show your reasoning in <think> tags and your final numerical answer in <answer> tags."},
+                    {"role": "user", "content": example["question"]},
+                ],
+                "answer": label,
+            }
+        return transform_fn, {"remove_columns": ["question"]}
+    ```
+  </Step>
+
+  <Step title="Write the config">
+    Create `config.yaml`:
+
+    ```yaml config.yaml
+    base_model: Qwen/Qwen2.5-1.5B-Instruct
+
+    rl: grpo
+    chat_template: tokenizer_default
+
+    vllm:
+      host: 0.0.0.0
+      port: 8000
+      gpu_memory_utilization: 0.85
+      dtype: auto
+      max_model_len: 2048
+
+    adapter: lora
+    lora_r: 32
+    lora_alpha: 64
+    lora_target_linear: true
+
+    trl:
+      use_vllm: true
+      use_data_producer: true
+      vllm_server_host: 0.0.0.0
+      vllm_server_port: 8000
+      vllm_server_timeout: 300
+      vllm_lora_sync: true
+      num_generations: 8
+      max_completion_length: 512
+      temperature: 0.7
+      reward_funcs:
+        - rewards.accuracy_reward
+        - rewards.format_reward
+      reward_weights:
+        - 1.0
+        - 0.5
+
+    datasets:
+      - path: openai/gsm8k
+        name: main
+        type: rewards.prompt_transform
+        split: train
+
+    skip_prepare_dataset: true
+    val_set_size: 0.0
+    sequence_len: 512
+    micro_batch_size: 2
+    gradient_accumulation_steps: 4
+    max_steps: 200
+    learning_rate: 5.0e-6
+    optimizer: adamw_torch_fused
+    lr_scheduler: cosine
+    warmup_steps: 10
+
+    bf16: true
+    flash_attention: true
+    gradient_checkpointing: true
+
+    special_tokens:
+      pad_token: "<|endoftext|>"
+
+    output_dir: ./grpo-output
+    logging_steps: 1
+    ```
+  </Step>
+
+  <Step title="Start vLLM and train">
+    ```bash
+    # Terminal 1: Start vLLM server on GPU 0
+    CUDA_VISIBLE_DEVICES=0 axolotl vllm-serve config.yaml
+
+    # Wait 30-90 seconds for model loading and CUDA graph capture
+
+    # Terminal 2: Train on GPU 1
+    CUDA_VISIBLE_DEVICES=1 axolotl train config.yaml
+    ```
+
+    <Tip>
+    Use `tmux` or separate terminal sessions to manage the two processes. The vLLM server must remain running for the entire training duration.
+    </Tip>
+  </Step>
+</Steps>
+
+## Custom reward functions
+
+### Function signature
+
+TRL calls reward functions with this signature:
+
+```python
+def my_reward(completions, **kwargs) -> list[float]:
+```
+
+- `completions` is a list of single-element lists where each element is `{"role": "assistant", "content": "..."}`. Access completion text via `completions[i][0]["content"]`.
+- `**kwargs` contains all dataset columns that were *not* removed by the dataset transform. Use this to pass ground-truth answers or metadata to your reward function.
+- Return a `list[float]` of the same length as `completions`.
+
+### Example: answer extraction
+
+```python rewards.py
+def accuracy_reward(completions, answer, **kwargs) -> list[float]:
+    rewards = []
+    for completion, correct_answer in zip(completions, answer):
+        text = completion[0]["content"]
+        match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        predicted = match.group(1).strip() if match else ""
+        rewards.append(1.0 if predicted == str(correct_answer) else 0.0)
+    return rewards
+```
+
+### Example: length penalty
+
+```python rewards.py
+def length_penalty(completions, **kwargs) -> list[float]:
+    """Penalize very short or very long completions."""
+    rewards = []
+    for completion in completions:
+        length = len(completion[0]["content"])
+        if length < 50:
+            rewards.append(-0.5)
+        elif length > 2000:
+            rewards.append(-0.2)
+        else:
+            rewards.append(0.0)
+    return rewards
+```
+
+### Multiple reward functions
+
+Combine multiple reward functions with independent weights:
+
+```yaml
+trl:
+  reward_funcs:
+    - rewards.accuracy_reward
+    - rewards.format_reward
+    - rewards.length_penalty
+  reward_weights:
+    - 1.0    # accuracy is most important
+    - 0.5    # format compliance
+    - 0.1    # mild length preference
+```
+
+<Warning>
+The reward module must be importable from the directory where you run `axolotl train`. If your reward file is `rewards.py`, use `rewards.accuracy_reward`. If it's inside a package `my_rewards/scoring.py`, use `my_rewards.scoring.accuracy_reward`.
+</Warning>
+
+### Neural network reward models
+
+Pass a HuggingFace model ID as a reward function and TRL will load it as a scalar reward model:
+
+```yaml
+trl:
+  reward_funcs:
+    - OpenAssistant/reward-model-deberta-v3-large-v2
+    - rewards.format_reward
+  reward_weights:
+    - 1.0
+    - 0.3
+```
+
+### Dataset transforms
+
+The dataset transform converts raw dataset rows into chat-format prompts:
+
+```python rewards.py
+def prompt_transform(cfg, *args, **kwargs):
+    def map_fn(example, tokenizer=None):
+        return {
+            "prompt": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": example["question"]},
+            ],
+            # Keep 'answer' for the reward function
+            "answer": example["answer"],
+        }
+    # Remove columns consumed by the transform; keep columns needed by rewards
+    return map_fn, {"remove_columns": ["question"]}
+```
+
+## Async training
+
+Async GRPO overlaps vLLM generation with training to reduce wall-clock time. While the model trains on the current batch, the next batch is already being generated.
+
+### Enabling async prefetch
+
+```yaml
+trl:
+  use_data_producer: true
+  async_prefetch: true
+  prefetch_depth: 1
+  vllm_sync_interval: 2
+```
+
+- `use_data_producer: true` is required for all async features.
+- `async_prefetch: true` runs generation in a background thread.
+- `prefetch_depth` controls how many batches to prefetch ahead (1 is usually sufficient).
+- `vllm_sync_interval` controls how often LoRA weights are synced to vLLM (every N optimizer steps).
+
+<Tip>
+Enable `vllm_importance_sampling_correction: true` when using `async_prefetch: true`. Because the background thread generates with slightly stale weights, IS correction adjusts the gradient for the distribution shift.
+</Tip>
+
+### Full async example
+
+```yaml config.yaml
+base_model: Qwen/Qwen2.5-1.5B-Instruct
+
+vllm:
+  host: 0.0.0.0
+  port: 8000
+  gpu_memory_utilization: 0.35
+  dtype: auto
+
+adapter: lora
+lora_r: 32
+lora_alpha: 64
+lora_target_linear: true
+
+rl: grpo
+trl:
+  use_data_producer: true
+  use_vllm: true
+  async_prefetch: true
+  prefetch_depth: 1
+  vllm_sync_interval: 2
+  vllm_lora_sync: true
+  streaming_partial_batch: true
+  vllm_importance_sampling_correction: true
+  off_policy_mask_threshold: 0.5
+  importance_sampling_level: token
+  num_generations: 8
+  max_completion_length: 512
+  reward_funcs:
+    - rewards.accuracy_reward
+  reroll_start_fraction: 0.5
+  replay_buffer_size: 100
+  reward_num_workers: 4
+  skip_zero_advantage_batches: true
+
+datasets:
+  - path: AI-MO/NuminaMath-TIR
+    type: rewards.prompt_transform
+    split: train
+
+gradient_accumulation_steps: 4
+micro_batch_size: 2
+max_steps: 500
+learning_rate: 1e-5
+bf16: true
+gradient_checkpointing: true
+```
+
+```bash
+# Terminal 1: Start vLLM on GPU 0
+CUDA_VISIBLE_DEVICES=0 axolotl vllm-serve config.yaml
+
+# Terminal 2: Train on GPU 1
+CUDA_VISIBLE_DEVICES=1 axolotl train config.yaml
+```
+
+### Advanced async options
+
+<AccordionGroup>
+  <Accordion title="Importance sampling correction">
+    Adjusts the gradient when completions were generated from an older policy version:
+
+    ```yaml
+    trl:
+      vllm_importance_sampling_correction: true
+      importance_sampling_level: token     # 'token' recommended with Liger kernel
+      off_policy_mask_threshold: 0.5       # Mask sequences too far off-policy
+    ```
+  </Accordion>
+  <Accordion title="Replay buffer">
+    Caches rollout groups with learning signal and reuses them when zero-signal groups appear:
+
+    ```yaml
+    trl:
+      replay_buffer_size: 100
+      replay_recompute_logps: true   # Recompute log-probs with current model
+    ```
+  </Accordion>
+  <Accordion title="Deferred re-rolling">
+    Buffers prompts where the model gets zero reward and re-injects them when the model has improved:
+
+    ```yaml
+    trl:
+      reroll_start_fraction: 0.5    # Start re-rolling after 50% of training
+      reroll_max_groups: 1          # Max groups to replace per batch
+    ```
+  </Accordion>
+  <Accordion title="Parallel reward workers">
+    Runs reward functions in subprocesses. Required for libraries that use `signal.alarm()` (e.g., `math_verify`):
+
+    ```yaml
+    trl:
+      reward_num_workers: 4
+    ```
+  </Accordion>
+  <Accordion title="LoRA sync (faster weight sync)">
+    Saves LoRA adapter weights to disk and has vLLM load them natively, avoiding NCCL contention:
+
+    ```yaml
+    adapter: lora
+    lora_r: 32
+    lora_alpha: 64
+    lora_target_linear: true
+
+    trl:
+      vllm_lora_sync: true
+    ```
+  </Accordion>
+  <Accordion title="DAPO / Dr. GRPO loss">
+    Alternative loss functions that reduce the penalty on longer responses:
+
+    ```yaml
+    trl:
+      loss_type: dr_grpo
+      max_completion_length: 256    # Normalizes loss based on this value
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Scaling with FSDP and DeepSpeed
+
+### FSDP (multi-GPU)
+
+Distribute training across multiple GPUs while vLLM runs on a dedicated GPU:
+
+```yaml
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_transformer_layer_cls_to_wrap: Qwen2DecoderLayer
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+```
+
+```bash
+# GPU 0: vLLM
+CUDA_VISIBLE_DEVICES=0 axolotl vllm-serve config.yaml
+
+# GPUs 1,2,3: Training
+CUDA_VISIBLE_DEVICES=1,2,3 axolotl train config.yaml
+```
+
+<Warning>
+With multi-GPU async prefetch, only rank 0 generates completions in the background thread. Results are broadcast to all ranks on the main thread to avoid FSDP collective deadlocks from unsynchronized background threads.
+</Warning>
+
+### DeepSpeed ZeRO-3
+
+```yaml
+deepspeed: deepspeed_configs/zero3_bf16.json
+gradient_checkpointing_kwargs:
+  use_reentrant: true   # Required for ZeRO-3
+```
+
+<Note>
+DeepSpeed ZeRO-3 requires `use_reentrant: true`. This is the opposite of the FSDP recommendation. Non-reentrant checkpointing causes tensor metadata mismatches with ZeRO-3's parameter partitioning.
+</Note>
+
+### Multi-GPU quick reference
+
+| Concern | Recommendation |
+|---------|----------------|
+| vLLM GPU allocation | Dedicate separate GPUs to vLLM; do not share with trainer |
+| Weight sync contention | Use `vllm_lora_sync: true` to avoid NCCL contention |
+| FSDP + async | Use `async_prefetch: false` or rely on rank-0-only background generation |
+| DeepSpeed + gradient checkpoint | Must use `use_reentrant: true` |
+| OOM during scoring | Reduce `micro_batch_size` or `num_generations` |
+
+## Monitoring
+
+Key metrics to watch during GRPO training:
+
+| Metric | Healthy range | What to check |
+|--------|--------------|---------------|
+| `rewards/*/mean` | > 0.15 within 20 steps | If stuck at 0, test your reward function standalone |
+| `reward_std` | > 0 on most steps | All-zero means no learning signal |
+| `entropy` | 0.05 – 0.5 | Below 0.01 suggests mode collapse |
+| `grad_norm` | 0.001 – 1.0 | > 10 is unstable; 0.0 is expected when zero-advantage skip fires |
+
+```bash
+# Pipe output to a log file for later inspection
+axolotl train config.yaml 2>&1 | tee /tmp/training.log
+```
+
+## Configuration reference
+
+All GRPO-specific options live under the `trl:` key. Standard training options (`learning_rate`, `micro_batch_size`, etc.) are set at the top level.
+
+<AccordionGroup>
+  <Accordion title="Core GRPO options">
+    | Option | Type | Default | Description |
+    |--------|------|---------|-------------|
+    | `use_vllm` | bool | `false` | Enable vLLM for generation |
+    | `num_generations` | int | — | Completions generated per prompt |
+    | `max_completion_length` | int | — | Maximum tokens per completion |
+    | `beta` | float | — | KL penalty coefficient |
+    | `loss_type` | str | — | `grpo`, `bnpo`, or `dr_grpo` |
+    | `scale_rewards` | bool | `true` | Normalize rewards by standard deviation |
+    | `temperature` | float | — | Sampling temperature |
+  </Accordion>
+  <Accordion title="Reward function options">
+    | Option | Type | Default | Description |
+    |--------|------|---------|-------------|
+    | `reward_funcs` | list[str] | — | Import paths or HF model IDs |
+    | `reward_weights` | list[float] | — | Relative weights for each reward |
+    | `multi_objective_aggregation` | str | — | `sum_then_normalize` (GRPO) or `normalize_then_sum` (GDPO) |
+    | `rollout_func` | str | — | Custom rollout function for OpenEnv-style tasks |
+  </Accordion>
+  <Accordion title="Async pipeline options">
+    | Option | Type | Default | Description |
+    |--------|------|---------|-------------|
+    | `use_data_producer` | bool | `false` | Required for all async features |
+    | `async_prefetch` | bool | `false` | Generate next batch in background thread |
+    | `prefetch_depth` | int | — | Batches to prefetch ahead |
+    | `vllm_sync_interval` | int | — | Sync weights every N optimizer steps |
+    | `vllm_lora_sync` | bool | `false` | Filesystem LoRA sync instead of NCCL |
+    | `streaming_partial_batch` | bool | — | Score prompt groups incrementally |
+    | `skip_zero_advantage_batches` | bool | `true` | Skip micro-batches with zero learning signal |
+    | `replay_buffer_size` | int | `0` | Max cached high-signal groups |
+    | `reward_num_workers` | int | `1` | Subprocess workers for reward computation |
+  </Accordion>
+  <Accordion title="Importance sampling options">
+    | Option | Type | Default | Description |
+    |--------|------|---------|-------------|
+    | `vllm_importance_sampling_correction` | bool | — | Enable IS correction for async shift |
+    | `importance_sampling_level` | str | — | `token` or `sequence` |
+    | `off_policy_mask_threshold` | float | — | KL threshold for masking off-policy sequences |
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Reward modelling" icon="star" href="/training/reward-modelling">
+    Train a reward model to use as a learned reward signal in GRPO.
+  </Card>
+  <Card title="Preference tuning" icon="thumbs-up" href="/training/preference-tuning">
+    DPO, KTO, ORPO — offline preference alignment methods.
+  </Card>
+</CardGroup>

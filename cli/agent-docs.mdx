@@ -1,0 +1,269 @@
+---
+title: "AI Agent Documentation with axolotl agent-docs"
+description: "Use axolotl agent-docs and config-schema to give AI coding agents like Claude Code, Cursor, or Copilot accurate bundled reference docs without internet access."
+---
+
+Axolotl ships two commands specifically designed for AI coding agents: `axolotl agent-docs` and `axolotl config-schema`. Together, they give tools like Claude Code, Cursor, GitHub Copilot, or any MCP-connected agent immediate access to accurate, current reference documentation — no internet access required, no hallucinated config keys.
+
+## axolotl agent-docs
+
+Prints agent-optimized markdown documentation bundled directly with the Axolotl pip package. The docs are structured for machine consumption: dense, minimal prose, maximum signal-to-noise.
+
+```bash
+axolotl agent-docs
+```
+
+Running the command without a topic argument shows the general overview — the best starting point for an agent beginning a new task.
+
+### Available topics
+
+<ParamField path="topic" type="string">
+  The documentation topic to display. Omit to show the overview.
+
+  ```bash
+  axolotl agent-docs [topic]
+  ```
+</ParamField>
+
+List all available topics:
+
+```bash
+axolotl agent-docs --list
+```
+
+This prints a table of every topic name and its title, for example:
+
+```
+  overview                  Axolotl overview and training methods
+  sft                       Supervised Fine-Tuning (SFT)
+  grpo                      GRPO online RL with reward functions
+  preference_tuning         DPO, IPO, KTO, ORPO, SimPO
+  reward_modelling          Outcome and process reward models
+  pretraining               Continual pretraining
+  model_architectures       Model-specific quirks and configurations
+  new_model_support         Debugging and adding new model support
+```
+
+### Topic reference
+
+<AccordionGroup>
+  <Accordion title="axolotl agent-docs sft">
+    Reference for supervised fine-tuning (SFT): the default training method for instruction-following, tool use, and input-output pairs.
+
+    ```bash
+    axolotl agent-docs sft
+    ```
+
+    Covers: dataset format (`type: chat_template`, `type: alpaca`), `train_on_inputs`, `roles_to_train`, sample packing, LoRA/QLoRA adapter setup, and a minimal working config.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs grpo">
+    Reference for GRPO (Group Relative Policy Optimization) — online reinforcement learning with verifiable reward functions. Used for math reasoning, code generation, and other tasks with ground-truth verifiers.
+
+    ```bash
+    axolotl agent-docs grpo
+    ```
+
+    Covers: `rl: grpo`, reward function signatures, `vllm_server` config, `trl.num_generations`, dataset format, async training architecture, and multi-GPU setup.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs preference_tuning">
+    Reference for preference-based alignment methods: DPO, IPO, KTO, ORPO, and SimPO.
+
+    ```bash
+    axolotl agent-docs preference_tuning
+    ```
+
+    Covers: `rl: dpo`, `rl: ipo`, `rl: kto`, `rl: orpo`, `rl: simpo`, dataset formats (chosen/rejected pairs, binary labels), `rl_beta`, `precompute_ref_log_probs`.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs reward_modelling">
+    Reference for training outcome reward models (ORM) and process reward models (PRM).
+
+    ```bash
+    axolotl agent-docs reward_modelling
+    ```
+
+    Covers: `reward_model: true`, `process_reward_model: true`, dataset format, `center_rewards_coefficient`, and how to integrate a reward model into GRPO training.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs pretraining">
+    Reference for continual pretraining on raw text corpora.
+
+    ```bash
+    axolotl agent-docs pretraining
+    ```
+
+    Covers: `pretraining_dataset`, `type: completion`, streaming datasets, `skip_prepare_dataset`, and when to use pretraining versus SFT.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs model_architectures">
+    Model-specific quirks, known issues, and recommended configurations for supported architectures.
+
+    ```bash
+    axolotl agent-docs model_architectures
+    ```
+
+    Covers: Gemma 4 hybrid attention, Qwen3.5 MoE expert quantization, Llama 4 linearized experts, and other model-specific notes.
+  </Accordion>
+
+  <Accordion title="axolotl agent-docs new_model_support">
+    Guide for debugging and adding support for newly released model architectures.
+
+    ```bash
+    axolotl agent-docs new_model_support
+    ```
+
+    Covers: config debugging checklist, common failure modes, how to write a new prompt strategy, and how to contribute model support.
+  </Accordion>
+</AccordionGroup>
+
+## axolotl config-schema
+
+Dumps the complete Pydantic JSON schema for `AxolotlInputConfig`. Every config field is listed with its type, default value, and description. This is the definitive source for config discovery.
+
+```bash
+axolotl config-schema
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--format` | `json \| yaml` | `json` | Output format |
+| `--field` | string | — | Show the schema for a single named field |
+
+**Examples:**
+
+```bash
+# Full schema as JSON (pipe to jq for filtering)
+axolotl config-schema | jq '.properties | keys'
+
+# Full schema as YAML
+axolotl config-schema --format yaml
+
+# Single field lookup
+axolotl config-schema --field adapter
+axolotl config-schema --field lora_r
+axolotl config-schema --field lr_scheduler
+```
+
+A single-field response looks like:
+
+```json
+{
+  "adapter": {
+    "anyOf": [
+      {"enum": ["lora", "qlora", "llama-adapter"], "type": "string"},
+      {"type": "null"}
+    ],
+    "default": null,
+    "description": "If you want to use 'lora', 'qlora', or 'llama-adapter', or leave blank to train all parameters in original model"
+  }
+}
+```
+
+## When to use these tools
+
+<Tabs>
+  <Tab title="Claude Code / OpenCode">
+    Place the following in your system prompt or project `AGENTS.md`:
+
+    ```
+    Before writing any Axolotl config, run:
+      axolotl agent-docs              # read the overview
+      axolotl agent-docs <topic>      # read the relevant method reference
+      axolotl config-schema --field <name>  # look up any specific field
+    ```
+
+    The `AGENTS.md` file at the root of the Axolotl repository already contains this guidance and is automatically read by Claude Code and similar tools.
+  </Tab>
+  <Tab title="Cursor / Copilot">
+    Add a `.cursorrules` or `copilot-instructions.md` pointing the agent to these commands:
+
+    ```markdown
+    For Axolotl fine-tuning tasks:
+    - Run `axolotl agent-docs` to get an overview of training methods
+    - Run `axolotl agent-docs <topic>` for method-specific reference
+    - Run `axolotl config-schema --field <name>` to verify any config key
+    - Never guess config field names; always verify against the schema
+    ```
+  </Tab>
+  <Tab title="MCP / tool use">
+    Wrap these commands as tool calls in your MCP server:
+
+    ```python
+    @mcp.tool()
+    def axolotl_agent_docs(topic: str = "overview") -> str:
+        """Get Axolotl reference docs for AI agents."""
+        result = subprocess.run(
+            ["axolotl", "agent-docs", topic],
+            capture_output=True, text=True
+        )
+        return result.stdout
+
+    @mcp.tool()
+    def axolotl_config_schema(field: str | None = None) -> str:
+        """Look up Axolotl config field schema."""
+        cmd = ["axolotl", "config-schema"]
+        if field:
+            cmd += ["--field", field]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.stdout
+    ```
+  </Tab>
+</Tabs>
+
+## Why agent-docs instead of web search
+
+<AccordionGroup>
+  <Accordion title="Always accurate for the installed version">
+    The docs are bundled with the installed package. When you run `pip install axolotl`, the agent-docs are included at the exact version that matches the installed codebase. There is no version mismatch between what the agent reads and what the code accepts.
+  </Accordion>
+  <Accordion title="No network access required">
+    Works in air-gapped environments, CI pipelines, and cloud training instances without outbound internet access.
+  </Accordion>
+  <Accordion title="Structured for machine consumption">
+    Agent docs are written to be dense and precise. They prioritize config key names, types, and valid values over narrative explanation. This reduces token usage and hallucination risk in agent responses.
+  </Accordion>
+  <Accordion title="Schema-backed field validation">
+    `axolotl config-schema --field <name>` returns the exact Pydantic schema for any field, including constraints, defaults, and enum values. Agents can use this to validate their output before running a training job.
+  </Accordion>
+</AccordionGroup>
+
+## Recommended agent workflow
+
+<Steps>
+  <Step title="Read the overview">
+    ```bash
+    axolotl agent-docs
+    ```
+    Understand the available training methods and choose the right one for the task.
+  </Step>
+  <Step title="Read the method-specific reference">
+    ```bash
+    axolotl agent-docs sft        # for instruction tuning
+    axolotl agent-docs grpo       # for RL with rewards
+    axolotl agent-docs preference_tuning  # for DPO/KTO/ORPO
+    ```
+    Get the required config keys, dataset format, and a working example config for the chosen method.
+  </Step>
+  <Step title="Validate config fields">
+    ```bash
+    axolotl config-schema --field lora_r
+    axolotl config-schema --field optimizer
+    ```
+    Before writing the final config file, verify each field name, type, and allowed values against the schema.
+  </Step>
+  <Step title="Preprocess and validate">
+    ```bash
+    axolotl preprocess config.yml --debug --debug-num-examples 3
+    ```
+    Catch tokenization or format issues before committing GPU time to a full training run.
+  </Step>
+  <Step title="Train">
+    ```bash
+    axolotl train config.yml
+    ```
+  </Step>
+</Steps>

@@ -1,0 +1,242 @@
+---
+title: "Loading Datasets into Axolotl"
+description: "Load datasets from HuggingFace Hub, local files, cloud storage (S3, GCS, Azure, OCI), or HTTPS into Axolotl using a simple YAML config."
+---
+
+Axolotl uses the HuggingFace `datasets` library under the hood, so the `datasets:` block in your config maps closely to the `load_dataset` API. You can point Axolotl at local files, a Hub repo, a cloud storage bucket, or a public HTTPS URL — all with the same YAML structure.
+
+<Tip>
+Most configs only need `path` and occasionally `data_files`. The other options are there when you need them.
+</Tip>
+
+## Common dataset config keys
+
+```yaml
+datasets:
+  - path:             # file path, directory, Hub repo ID, or URL
+    name:             # dataset subset / config name (Hub datasets)
+    data_files:       # specific file(s) within a directory or Hub repo
+    split:            # e.g. "train", "train[:10%]"
+    revision:         # git commit, tag, or branch for Hub datasets
+    trust_remote_code: false
+```
+
+You can also list multiple datasets in a single run — Axolotl shuffles and merges them automatically.
+
+```yaml
+datasets:
+  - path: /path/to/first/dataset
+  - path: /path/to/second/dataset
+```
+
+---
+
+## Loading from local files
+
+<Tabs>
+  <Tab title="Single file">
+    Point `path` directly at the file. If you omit `ds_type`, Axolotl infers the format from the extension.
+
+    ```yaml
+    datasets:
+      - path: data.jsonl
+        ds_type: json   # optional when extension is unambiguous
+    ```
+
+    Supported extensions: `.json`, `.jsonl`, `.csv`, `.parquet`, `.arrow`.
+  </Tab>
+  <Tab title="Entire directory">
+    Set `path` to the directory. Axolotl will first try to load a dataset saved with `datasets.save_to_disk`, then fall back to loading all files in the directory.
+
+    ```yaml
+    datasets:
+      - path: /path/to/your/directory
+    ```
+  </Tab>
+  <Tab title="Specific files in directory">
+    Use `data_files` to select one or more files from a directory.
+
+    ```yaml
+    datasets:
+      # single file
+      - path: /path/to/your/directory
+        ds_type: csv
+        data_files: file1.csv
+
+      # multiple JSONL files
+      - path: /path/to/your/directory
+        ds_type: json
+        data_files:
+          - file1.jsonl
+          - file2.jsonl
+
+      # multiple Parquet files
+      - path: /path/to/your/directory
+        ds_type: parquet
+        data_files:
+          - file1.parquet
+          - file2.parquet
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Loading from HuggingFace Hub
+
+<Tabs>
+  <Tab title="HuggingFace Dataset (push_to_hub)">
+    For datasets pushed via `datasets.push_to_hub`, just provide the repo ID.
+
+    ```yaml
+    datasets:
+      - path: org/dataset-name
+    ```
+
+    Use additional keys when needed:
+
+    ```yaml
+    datasets:
+      - path: org/dataset-name
+        name: default          # subset / config name
+        split: train
+        revision: main         # branch, tag, or commit SHA
+        trust_remote_code: false
+    ```
+  </Tab>
+  <Tab title="Folder uploaded to Hub">
+    For repos where raw files were uploaded directly (not via `push_to_hub`), specify the files with `data_files`.
+
+    ```yaml
+    datasets:
+      - path: org/dataset-name
+        data_files:
+          - file1.jsonl
+          - file2.jsonl
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+For private datasets, set `hf_use_auth_token: true` at the root of your config and ensure your HuggingFace token is available in the environment.
+</Note>
+
+---
+
+## Loading from cloud storage
+
+<Warning>
+Cloud storage loading is currently experimental. Please report any issues you encounter.
+</Warning>
+
+Prepend the path with the appropriate protocol for your provider. Single files are loaded with `load_dataset`; directories are loaded with `load_from_disk`.
+
+<Tabs>
+  <Tab title="Amazon S3">
+    Prefix: `s3://`
+
+    ```yaml
+    datasets:
+      - path: s3://bucket-name/path/to/file.jsonl
+
+      # or a directory
+      - path: s3://bucket-name/path/to/directory
+    ```
+
+    Credentials are resolved in this order:
+    1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` environment variables
+    2. `~/.aws/credentials` file
+    3. EC2 instance IAM metadata provider
+
+    See the [boto3 configuration docs](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html#using-environment-variables) for the full list of supported environment variables.
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    Prefix: `gs://` or `gcs://`
+
+    ```yaml
+    datasets:
+      - path: gs://bucket-name/path/to/file.jsonl
+    ```
+
+    Credentials are resolved in this order:
+    1. gcloud credentials
+    2. GCP metadata service (when running on GCP)
+    3. Anonymous access
+  </Tab>
+  <Tab title="Azure Blob Storage">
+    **Gen 1** — prefix `adl://`
+
+    Required environment variables:
+    - `AZURE_STORAGE_TENANT_ID`
+    - `AZURE_STORAGE_CLIENT_ID`
+    - `AZURE_STORAGE_CLIENT_SECRET`
+
+    **Gen 2** — prefix `abfs://` or `az://`
+
+    Required environment variables:
+    - `AZURE_STORAGE_ACCOUNT_NAME`
+    - `AZURE_STORAGE_ACCOUNT_KEY`
+
+    ```yaml
+    datasets:
+      - path: abfs://container/path/to/file.jsonl
+    ```
+
+    See the [adlfs docs](https://github.com/fsspec/adlfs?tab=readme-ov-file#setting-credentials) for additional options.
+  </Tab>
+  <Tab title="Oracle Cloud (OCI)">
+    Prefix: `oci://`
+
+    ```yaml
+    datasets:
+      - path: oci://bucket@namespace/path/to/file.jsonl
+    ```
+
+    Credentials are resolved in this order:
+    1. `OCIFS_IAM_TYPE`, `OCIFS_CONFIG_LOCATION`, `OCIFS_CONFIG_PROFILE` environment variables
+    2. OCI resource principal (when running on OCI)
+
+    Additional variable: `OCI_REGION_METADATA`. See the [ocifs docs](https://ocifs.readthedocs.io/en/latest/getting-connected.html#Using-Environment-Variables).
+  </Tab>
+</Tabs>
+
+---
+
+## Loading from HTTPS
+
+For publicly accessible files, provide the full URL.
+
+```yaml
+datasets:
+  - path: https://example.com/path/to/dataset.jsonl
+```
+
+<Note>
+The URL must be publicly accessible — authenticated HTTPS is not currently supported.
+</Note>
+
+---
+
+## Dataset splits and subsets
+
+Use `split` to select a portion of a dataset, and `name` to select a subset (also called a config).
+
+```yaml
+datasets:
+  - path: org/dataset-name
+    name: en                  # subset name
+    split: train              # or "train[:10%]", "test", etc.
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Dataset Formats" icon="table" href="/datasets/formats">
+    Learn which dataset format type to use for your data structure.
+  </Card>
+  <Card title="Preprocessing" icon="bolt" href="/datasets/preprocessing">
+    Cache tokenized datasets to speed up repeated training runs.
+  </Card>
+</CardGroup>

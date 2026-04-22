@@ -1,0 +1,288 @@
+---
+title: "Supervised Fine-Tuning with Axolotl"
+description: "Fine-tune language models with Axolotl using full fine-tuning, LoRA, or QLoRA. Configure datasets, adapters, and training settings via a single YAML file."
+---
+
+Supervised fine-tuning (SFT) teaches a pre-trained model to follow instructions or produce specific output styles by training on input-output pairs. Axolotl makes SFT config-driven: every aspect of a training run — the base model, adapter type, dataset, and hyperparameters — is specified in a single YAML file passed to `axolotl train`.
+
+## Choosing a fine-tuning approach
+
+Axolotl supports three SFT modes that differ in memory usage and training speed.
+
+<CardGroup cols={3}>
+  <Card title="Full fine-tuning" icon="server">
+    Updates all model weights. Highest quality, highest VRAM requirement. No adapter key needed.
+  </Card>
+  <Card title="LoRA" icon="layers">
+    Trains low-rank adapter layers. Most weights stay frozen. Set `adapter: lora`.
+  </Card>
+  <Card title="QLoRA" icon="microchip">
+    LoRA on a 4-bit quantized base model. Lowest VRAM. Set `adapter: qlora` and `load_in_4bit: true`.
+  </Card>
+</CardGroup>
+
+## Configuration
+
+### Full fine-tuning
+
+Full fine-tuning updates every parameter in the model. Omit the `adapter` and quantization keys:
+
+```yaml full-finetune.yml
+base_model: NousResearch/Llama-3.2-1B
+
+datasets:
+  - path: teknium/GPT4-LLM-Cleaned
+    type: alpaca
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.1
+output_dir: ./outputs/full-out
+```
+
+### LoRA
+
+LoRA injects trainable rank-decomposition matrices into the model's attention and MLP layers, leaving the base weights frozen:
+
+```yaml lora.yml
+base_model: NousResearch/Llama-3.2-1B
+
+load_in_8bit: true
+adapter: lora
+
+datasets:
+  - path: teknium/GPT4-LLM-Cleaned
+    type: alpaca
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.1
+output_dir: ./outputs/lora-out
+```
+
+<Tip>
+`load_in_8bit: true` loads the base model in 8-bit precision, reducing VRAM usage while the LoRA adapter layers remain in full precision.
+</Tip>
+
+### QLoRA
+
+QLoRA combines 4-bit base model quantization with LoRA adapters, enabling fine-tuning of large models on a single consumer GPU:
+
+```yaml qlora.yml
+base_model: NousResearch/Llama-3.2-1B
+
+load_in_4bit: true
+adapter: qlora
+
+datasets:
+  - path: teknium/GPT4-LLM-Cleaned
+    type: alpaca
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.1
+output_dir: ./outputs/qlora-out
+```
+
+## Key configuration options
+
+<AccordionGroup>
+  <Accordion title="base_model">
+    The HuggingFace model ID or local path to the pre-trained model to fine-tune.
+
+    ```yaml
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    ```
+  </Accordion>
+
+  <Accordion title="adapter">
+    Controls the adapter type. Omit for full fine-tuning.
+
+    ```yaml
+    adapter: lora    # or qlora
+    ```
+  </Accordion>
+
+  <Accordion title="load_in_8bit / load_in_4bit">
+    Load the base model in quantized precision to reduce VRAM.
+
+    ```yaml
+    load_in_8bit: true   # 8-bit, use with adapter: lora
+    # or
+    load_in_4bit: true   # 4-bit, use with adapter: qlora
+    ```
+  </Accordion>
+
+  <Accordion title="output_dir">
+    Directory where checkpoints and the final model are saved.
+
+    ```yaml
+    output_dir: ./outputs/my-run
+    ```
+  </Accordion>
+
+  <Accordion title="Training hyperparameters">
+    Core training settings that apply regardless of adapter type:
+
+    ```yaml
+    micro_batch_size: 2
+    gradient_accumulation_steps: 4
+    num_epochs: 3
+    learning_rate: 0.0003
+    lr_scheduler: cosine
+    optimizer: adamw_torch_fused
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Dataset configuration
+
+Axolotl supports many dataset formats. The `type` field selects the prompt strategy — how raw dataset rows are converted into model inputs.
+
+<Tabs>
+  <Tab title="Alpaca format">
+    The `alpaca` type expects `instruction`, `input` (optional), and `output` fields:
+
+    ```yaml
+    datasets:
+      - path: teknium/GPT4-LLM-Cleaned
+        type: alpaca
+    ```
+
+    Example row:
+
+    ```json
+    {
+      "instruction": "Write a description of alpacas.",
+      "input": "",
+      "output": "Alpacas are domesticated South American camelids..."
+    }
+    ```
+  </Tab>
+  <Tab title="Chat template format">
+    The `chat_template` type handles multi-turn conversation data:
+
+    ```yaml
+    datasets:
+      - path: HuggingFaceH4/ultrachat_200k
+        type: chat_template
+        split: train_sft
+    ```
+
+    Example row:
+
+    ```json
+    {
+      "messages": [
+        {"role": "user", "content": "Classify this text: I love this!"},
+        {"role": "assistant", "content": "positive"}
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Local JSONL file">
+    Point `path` to a local file and set `ds_type: json`:
+
+    ```yaml
+    datasets:
+      - ds_type: json
+        data_files:
+          - my_data.jsonl
+        split: train
+        type: alpaca
+    ```
+
+    Example JSONL content:
+
+    ```json
+    {"instruction": "Classify this text", "input": "I love this!", "output": "positive"}
+    {"instruction": "Classify this text", "input": "Not good at all", "output": "negative"}
+    ```
+  </Tab>
+</Tabs>
+
+## Training flow
+
+When you run `axolotl train config.yml`, Axolotl executes the following steps:
+
+<Steps>
+  <Step title="Download the base model">
+    The model specified in `base_model` is downloaded from HuggingFace (or loaded from a local path).
+  </Step>
+  <Step title="Apply adapter layers">
+    If `adapter: lora` or `adapter: qlora` is set, LoRA modules are injected into the attention and MLP layers. With `load_in_4bit: true`, the base model is loaded in NF4 quantized format first.
+  </Step>
+  <Step title="Load and process the dataset">
+    Datasets are downloaded, tokenized, and formatted using the selected prompt strategy. If `dataset_prepared_path` is set, the tokenized dataset is cached to disk for reuse.
+  </Step>
+  <Step title="Run the training loop">
+    The model trains for `num_epochs` epochs (or `max_steps` steps). Gradients accumulate over `gradient_accumulation_steps` micro-batches before each optimizer step.
+  </Step>
+  <Step title="Save the model">
+    Checkpoints are saved to `output_dir`. For LoRA runs, adapter weights are saved separately and can be merged into the base model afterward.
+  </Step>
+</Steps>
+
+## Running training
+
+```bash
+# Download example configs
+axolotl fetch examples
+
+# Train with an example LoRA config
+axolotl train examples/llama-3/lora-1b.yml
+
+# Or train with your own config
+axolotl train my_training.yml
+```
+
+## Common post-training tasks
+
+<Tabs>
+  <Tab title="Test with inference">
+    Run interactive inference against the trained model or adapter:
+
+    ```bash
+    axolotl inference my_training.yml --lora-model-dir="./outputs/lora-out"
+    ```
+
+    Launch a Gradio UI instead:
+
+    ```bash
+    axolotl inference my_training.yml --lora-model-dir="./outputs/lora-out" --gradio
+    ```
+  </Tab>
+  <Tab title="Preprocess the dataset">
+    For large datasets, tokenize and cache the dataset before training:
+
+    ```bash
+    axolotl preprocess my_training.yml
+    ```
+
+    Set `dataset_prepared_path` in your config to specify where to save the prepared data.
+  </Tab>
+  <Tab title="Merge LoRA weights">
+    Merge adapter weights back into the base model to produce a standalone model:
+
+    ```bash
+    axolotl merge-lora my_training.yml --lora-model-dir="./outputs/lora-out"
+    ```
+
+    The merged model is saved to `{output_dir}/merged`.
+  </Tab>
+</Tabs>
+
+<Note>
+The same YAML config file is used for training, inference, and merging — you do not need separate configs for each step.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Preference tuning (DPO, KTO, ORPO)" icon="thumbs-up" href="/training/preference-tuning">
+    Align your SFT model further using human preference signals.
+  </Card>
+  <Card title="GRPO" icon="trophy" href="/training/grpo">
+    Train with reinforcement learning and custom reward functions.
+  </Card>
+  <Card title="Dataset formats" icon="table" href="/datasets/formats">
+    Full reference for all supported dataset types and custom formats.
+  </Card>
+  <Card title="Multi-GPU training" icon="server" href="/optimizations/multi-gpu">
+    Scale training across multiple GPUs with FSDP or DeepSpeed.
+  </Card>
+</CardGroup>

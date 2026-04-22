@@ -1,97 +1,87 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Axolotl: Open Source LLM Fine-tuning Framework"
+description: "Axolotl makes fine-tuning large language models simple and accessible. Go from raw model to fine-tuned in minutes with a single YAML config."
 ---
 
-## Setting up
+Axolotl is a free and open-source framework for post-training and fine-tuning large language models. Whether you're doing instruction tuning with SFT, preference alignment with DPO, or reinforcement learning with GRPO, Axolotl unifies the full pipeline — dataset preprocessing, training, evaluation, and inference — into a single YAML configuration file.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Set up Axolotl with pip, uv, Docker, or on a cloud provider. Get your environment ready in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Fine-tune your first model with LoRA in a few commands. A step-by-step walkthrough from config to trained model.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Choose a Training Method" icon="map" href="/choosing-method">
+    Not sure whether to use SFT, DPO, or GRPO? This decision guide helps you pick the right approach for your data and goals.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Configuration Reference" icon="gear" href="/config/overview">
+    Every config option explained — model, adapter, datasets, hyperparameters, and more.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Training methods
 
-Everything you need to create world-class documentation.
+Axolotl supports the full spectrum of LLM fine-tuning approaches, all configured through YAML.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Supervised Fine-Tuning" icon="graduation-cap" href="/training/supervised-fine-tuning">
+    Full fine-tuning, LoRA, and QLoRA for instruction tuning and task-specific adaptation.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Preference Tuning" icon="thumbs-up" href="/training/preference-tuning">
+    DPO, IPO, KTO, ORPO, and GDPO for aligning models with human preferences.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="GRPO & Reinforcement Learning" icon="brain" href="/training/grpo">
+    Group Relative Policy Optimization with async vLLM generation and custom reward functions.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Multimodal Training" icon="image" href="/training/multimodal">
+    Fine-tune vision-language models including Llama 4, Qwen2-VL, Gemma 3, and more.
   </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Key features
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={3}>
+  <Card title="Multi-GPU scaling" icon="server" href="/optimizations/multi-gpu">
+    DeepSpeed ZeRO, FSDP1, FSDP2 — scale from one GPU to a full cluster.
+  </Card>
+  <Card title="Performance optimizations" icon="bolt" href="/optimizations/overview">
+    Flash Attention, sample packing, LoRA kernel optimizations, and mixed precision.
+  </Card>
+  <Card title="Flexible datasets" icon="database" href="/datasets/loading">
+    Load from local files, HuggingFace Hub, S3, GCS, Azure Blob, or OCI.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install Axolotl">
+    Install via pip or uv with your preferred CUDA version:
+    ```bash
+    uv pip install --no-build-isolation axolotl[flash-attn,deepspeed]
+    ```
+  </Step>
+  <Step title="Fetch example configs">
+    Download ready-to-use example configurations:
+    ```bash
+    axolotl fetch examples
+    ```
+  </Step>
+  <Step title="Train your first model">
+    Run a LoRA fine-tune on a 1B Llama model — works on most GPUs:
+    ```bash
+    axolotl train examples/llama-3/lora-1b.yml
+    ```
+  </Step>
+  <Step title="Run inference">
+    Test your trained model interactively:
+    ```bash
+    axolotl inference examples/llama-3/lora-1b.yml --lora-model-dir="./outputs/lora-out"
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Axolotl requires an NVIDIA GPU (Ampere or newer for bf16 and Flash Attention) or an AMD GPU, Python ≥3.11, and PyTorch ≥2.9.0.
+</Note>

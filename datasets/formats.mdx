@@ -1,0 +1,526 @@
+---
+title: "Dataset Formats Supported by Axolotl"
+description: "Complete reference for every dataset format in Axolotl: chat_template, alpaca, input_output, completion, pretraining, and stepwise supervised."
+---
+
+Axolotl maps each dataset entry to a training prompt through a **prompt strategy** selected by the `type:` key in your dataset config. Choosing the right format depends on what your raw data looks like and what you want the model to learn. This page covers every supported format with its expected JSON structure and corresponding YAML config.
+
+<Tip>
+Work backwards from your data: if you have conversation messages, use `chat_template`; if you have instruction/response pairs, use `alpaca` or a custom instruct format; if you have raw text, use `completion` or `pretraining_dataset`.
+</Tip>
+
+---
+
+## Format selection guide
+
+```
+Do you have pre-tokenized data?          → Pre-tokenized (type: )
+Do you need full control over masking?   → Template-free (type: input_output)
+Is your data a list of messages?         → Conversation (type: chat_template)
+Is your data instruction + response?     → Instruction (type: alpaca, etc.)
+Is your data raw text for pretraining?   → Completion (type: completion) or pretraining_dataset
+Is your data stepwise chain-of-thought?  → Stepwise supervised
+```
+
+---
+
+## Conversation / Chat formats
+
+Conversation datasets contain a list of messages, each with a role (`user`, `assistant`, `system`) and content. Axolotl renders these through a Jinja2 chat template, matching what the model sees at inference time.
+
+### chat_template
+
+The recommended format for all multi-turn chat data. Uses the tokenizer's built-in `chat_template` or a named template you specify.
+
+**Data structure (OpenAI format):**
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "How can I help you?"},
+    {"role": "user", "content": "Can you add 3+5?"},
+    {"role": "assistant", "content": "The answer is 8."}
+  ]
+}
+```
+
+<Tabs>
+  <Tab title="Tokenizer default">
+    Use the chat template already baked into the tokenizer config.
+
+    ```yaml
+    datasets:
+      - path: my_dataset.jsonl
+        type: chat_template
+        roles_to_train: ["assistant"]
+        train_on_eos: turn
+    ```
+  </Tab>
+  <Tab title="Named template (e.g. ChatML)">
+    Override the tokenizer's template with a named one. This also sets the EOS token correctly for the template.
+
+    ```yaml
+    chat_template: chatml
+
+    special_tokens:
+      eos_token: <|im_end|>
+
+    datasets:
+      - path: my_dataset.jsonl
+        type: chat_template
+        roles_to_train: ["assistant"]
+        train_on_eos: turn
+    ```
+  </Tab>
+  <Tab title="Default with fallback">
+    Use the tokenizer's template, falling back to ChatML if none is set.
+
+    ```yaml
+    chat_template: tokenizer_default_fallback_chatml
+
+    datasets:
+      - path: my_dataset.jsonl
+        type: chat_template
+    ```
+  </Tab>
+  <Tab title="Custom Jinja template">
+    Provide your own Jinja2 template inline or as a `.jinja2` file.
+
+    ```yaml
+    chat_template_jinja: "{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') %}{{'<|user|>' + '\n' + message['content'] + '<|end|>' + '\n' + '<|assistant|>' + '\n'}}{% elif message['role'] == 'assistant' %}{{message['content'] + '<|end|>' + '\n'}}{% endif %}{% endfor %}"
+
+    datasets:
+      - path: my_dataset.jsonl
+        type: chat_template
+    ```
+
+    You can also point to a file:
+
+    ```yaml
+    chat_template_jinja: ./my_template.jinja2
+    ```
+  </Tab>
+</Tabs>
+
+#### Customizing field names and role mappings
+
+If your data uses different key names (e.g. ShareGPT's `from`/`value` instead of `role`/`content`), configure the mappings:
+
+```yaml
+datasets:
+  - path: my_dataset.jsonl
+    type: chat_template
+    field_messages: conversations      # key containing the message list
+    message_property_mappings:
+      role: from                       # maps "from" → "role"
+      content: value                   # maps "value" → "content"
+    roles:
+      assistant:
+        - gpt
+        - model
+      user:
+        - human
+```
+
+#### Masking options
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `roles_to_train` | list of role names | Only these roles contribute to the loss. Default: `["assistant"]`. |
+| `train_on_eos` | `"turn"`, `"last"`, `"all"` | Which EOS tokens to include in training loss. |
+| `train_on_inputs` | `true` / `false` | Train on all tokens (no masking). |
+
+#### Per-message and per-part training control
+
+For fine-grained masking, add a `train` field directly to each message:
+
+```json
+{
+  "conversations": [
+    {"from": "system", "value": "You are an AI assistant.", "train": false},
+    {"from": "human", "value": "Hello", "train": false},
+    {"from": "assistant", "value": "Hello", "train": true}
+  ]
+}
+```
+
+```yaml
+datasets:
+  - path: my_dataset.jsonl
+    type: chat_template
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+    roles_to_train: []
+    message_field_training: train
+```
+
+You can also split a single message's content into parts, each with its own `train` flag — useful for masking reasoning traces while training on answers:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "What is 2+2?"}]},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "text", "text": "Let me think step by step...", "train": false},
+        {"type": "text", "text": " The answer is 4.", "train": true}
+      ]
+    }
+  ]
+}
+```
+
+<Warning>
+BPE tokenizers merge spaces with the following word into a single token. Always place spaces at the **start** of the next part rather than the end of the previous one, to avoid straddling tokens being masked unexpectedly.
+</Warning>
+
+#### Tool use
+
+Pass tool definitions in a `tools` column and let the chat template render them:
+
+```json
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "calculator",
+        "description": "Performs arithmetic",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+      }
+    }
+  ],
+  "messages": [...]
+}
+```
+
+```yaml
+chat_template: llama4
+datasets:
+  - path: my_dataset.jsonl
+    type: chat_template
+    # field_tools: tools  # default
+```
+
+#### EOT tokens (Mistral Tekken and similar)
+
+When the template uses a different End-of-Turn token from the EOS token:
+
+```yaml
+eot_tokens:
+  - "[/INST]"
+
+datasets:
+  - path: my_dataset.jsonl
+    type: chat_template
+    train_on_eos: last
+    train_on_eot: turn
+```
+
+#### Migrating from sharegpt
+
+```yaml
+# Before
+chat_template: chatml
+datasets:
+  - path: my_data.jsonl
+    type: sharegpt
+    conversation: chatml
+
+# After
+chat_template: chatml
+datasets:
+  - path: my_data.jsonl
+    type: chat_template
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+```
+
+<Note>
+`type: sharegpt` is deprecated. Migrate to `type: chat_template` using the mapping above.
+</Note>
+
+---
+
+## Instruction tuning formats
+
+Instruction datasets are single-turn: a prompt (instruction + optional input) and a single response. Axolotl masks the prompt and trains only on the response.
+
+### alpaca
+
+The most common instruction format. `input` is optional.
+
+```json
+{"instruction": "Summarize the following.", "input": "Text to summarize...", "output": "Summary."}
+```
+
+```yaml
+datasets:
+  - path: my_dataset.jsonl
+    type: alpaca
+```
+
+### Custom instruct format
+
+When your data doesn't fit a built-in format, define the template inline:
+
+```json
+{"input": "What is the capital of France?", "output": "Paris."}
+```
+
+```yaml
+datasets:
+  - path: my_dataset.jsonl
+    type:
+      system_prompt: ""
+      field_instruction: input
+      field_output: output
+      format: "[INST] {instruction} [/INST]"
+      no_input_format: "[INST] {instruction} [/INST]"
+```
+
+### Other built-in instruction types
+
+<AccordionGroup>
+  <Accordion title="jeopardy — question and answer">
+    ```json
+    {"question": "...", "category": "...", "answer": "..."}
+    ```
+    ```yaml
+    type: jeopardy
+    ```
+  </Accordion>
+  <Accordion title="oasst — instruction/response">
+    ```json
+    {"INSTRUCTION": "...", "RESPONSE": "..."}
+    ```
+    ```yaml
+    type: oasst
+    ```
+  </Accordion>
+  <Accordion title="gpteacher — instruction with optional input">
+    ```json
+    {"instruction": "...", "input": "...", "response": "..."}
+    ```
+    ```yaml
+    type: gpteacher
+    ```
+  </Accordion>
+  <Accordion title="reflection — instruction with self-correction">
+    ```json
+    {"instruction": "...", "input": "...", "output": "...", "reflection": "...", "corrected": "..."}
+    ```
+    ```yaml
+    type: reflection
+    ```
+  </Accordion>
+  <Accordion title="summarizetldr — article summarization">
+    ```json
+    {"article": "...", "summary": "..."}
+    ```
+    ```yaml
+    type: summarizetldr
+    ```
+  </Accordion>
+  <Accordion title="alpaca_chat — basic alpaca chat">
+    ```json
+    {"instruction": "...", "input": "...", "response": "..."}
+    ```
+    ```yaml
+    type: alpaca_chat
+    ```
+  </Accordion>
+  <Accordion title="alpaca_chat.load_qa — question and answer">
+    ```json
+    {"question": "...", "answer": "..."}
+    ```
+    ```yaml
+    type: alpaca_chat.load_qa
+    ```
+  </Accordion>
+  <Accordion title="alpaca_w_system.load_open_orca — with system prompt">
+    ```json
+    {"system_prompt": "...", "question": "...", "response": "..."}
+    ```
+    ```yaml
+    type: alpaca_w_system.load_open_orca
+    ```
+  </Accordion>
+  <Accordion title="context_qa — in-context question answering">
+    ```json
+    {"article": "...", "question": "...", "answer": "..."}
+    ```
+    ```yaml
+    type: context_qa
+    ```
+
+    Alternate version with `context` key:
+    ```json
+    {"context": "...", "question": "...", "answer": "..."}
+    ```
+    ```yaml
+    type: context_qa.load_v2
+    ```
+  </Accordion>
+  <Accordion title="metharme — adds additional EOS tokens">
+    ```json
+    {"prompt": "...", "generation": "..."}
+    ```
+    ```yaml
+    type: metharme
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Pretraining / completion formats
+
+Pretraining trains on raw text with no input masking — every token contributes to the loss.
+
+### completion (non-streaming, fits in memory)
+
+For datasets small enough to load entirely into memory. The full dataset is pre-tokenized before training. Texts longer than `sequence_len` are split into multiple samples.
+
+```json
+{"text": "First document text."}
+{"text": "Second document text."}
+```
+
+```yaml
+datasets:
+  - path: my_corpus
+    type: completion
+```
+
+### pretraining_dataset (streaming, large corpora)
+
+For large corpora that don't fit in memory. Data is tokenized on-demand during training.
+
+```json
+{"text": "First document."}
+{"text": "Second document."}
+```
+
+```yaml
+pretraining_dataset:
+  - path: HuggingFaceFW/fineweb-edu
+    type: pretrain
+    text_column: text
+    split: train
+```
+
+<Warning>
+`pretraining_dataset` requires `max_steps` in your config — Axolotl cannot infer the dataset length from a stream. One step processes `sequence_len × micro_batch_size × gradient_accumulation_steps × num_gpus` tokens.
+</Warning>
+
+---
+
+## Template-free format
+
+Use `type: input_output` when you want full manual control over prompt formatting and token masking without relying on a chat template or instruct template. This is useful for highly custom prompt structures.
+
+Each sample has a `segments` list. Set `"label": false` on segments you want masked (excluded from the loss).
+
+```json
+{
+  "segments": [
+    {"label": true,  "text": "<s>Hello\n"},
+    {"label": true,  "text": "hi there!. "},
+    {"label": false, "text": "goodbye "},
+    {"label": true,  "text": "farewell</s>"}
+  ]
+}
+```
+
+```yaml
+train_on_inputs: false
+datasets:
+  - path: output.jsonl
+    type: input_output
+```
+
+<Note>
+You are responsible for all special tokens (BOS, EOS, spaces, newlines). Axolotl concatenates segments as-is without adding anything.
+</Note>
+
+Use `axolotl preprocess config.yaml --debug` to verify masking. The output format is `token(label, token_id)` — a label of `-100` means the token is masked.
+
+---
+
+## Pre-tokenized format
+
+Bring your own tokenized dataset. Axolotl expects three columns:
+
+| Column | Description |
+|--------|-------------|
+| `input_ids` | Token IDs from the formatted prompt |
+| `attention_mask` | Padding mask (`1` for real tokens, `0` for padding) |
+| `labels` | Same as `input_ids`, with `-100` at positions to mask |
+
+```yaml
+datasets:
+  - path: my_tokenized_dataset
+    type:             # intentionally empty
+```
+
+<Tip>
+Remember to include BOS/EOS tokens in your `input_ids` and mask them appropriately in `labels`.
+</Tip>
+
+---
+
+## Stepwise supervised format
+
+Designed for chain-of-thought (CoT) reasoning datasets used to train process reward models (PRMs). Each example provides a prompt, a sequence of completion steps, and a correctness label for each step.
+
+```json
+{
+  "prompt": "Which number is larger, 9.8 or 9.11?",
+  "completions": [
+    "The fractional part of 9.8 is 0.8, while the fractional part of 9.11 is 0.11.",
+    "Since 0.11 is greater than 0.8, the number 9.11 is larger than 9.8."
+  ],
+  "labels": [true, false]
+}
+```
+
+The `labels` array marks each step as correct (`true`) or incorrect (`false`). See the [RLHF documentation](/training/preference-tuning) for the corresponding config.
+
+---
+
+## Mixing datasets
+
+You can combine multiple datasets of different formats in a single training run. Axolotl shuffles and merges them automatically.
+
+```yaml
+datasets:
+  - path: org/chat-dataset
+    type: chat_template
+    roles_to_train: ["assistant"]
+
+  - path: org/instruct-dataset
+    type: alpaca
+
+  - path: local/custom.jsonl
+    type: input_output
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Loading datasets" icon="database" href="/datasets/loading">
+    Load from local files, HuggingFace Hub, or cloud storage.
+  </Card>
+  <Card title="Preprocessing" icon="bolt" href="/datasets/preprocessing">
+    Cache tokenized datasets to speed up repeated training runs.
+  </Card>
+</CardGroup>

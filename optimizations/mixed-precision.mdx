@@ -1,0 +1,160 @@
+---
+title: "Mixed Precision Training: bf16, fp16, and fp8"
+description: "Configure bf16, fp16, and fp8 mixed precision in Axolotl, including torchao FP8 setup, FSDP compatibility, and Quantization Aware Training."
+keywords: ["mixed precision", "bf16", "fp16", "fp8", "torchao", "quantization aware training", "QAT", "torch compile"]
+---
+
+Mixed precision training uses lower-precision data types to reduce memory usage and increase training throughput while maintaining model quality. Axolotl supports FP16, BF16, and FP8, with BF16 recommended for most modern hardware.
+
+---
+
+## BF16 (recommended for Ampere+)
+
+BF16 (Brain Float 16) offers the same dynamic range as FP32 with half the memory footprint. It is numerically more stable than FP16 and does not require gradient scaling.
+
+```yaml
+# Automatic detection (recommended — falls back to fp32 if unsupported)
+bf16: auto
+
+# Explicit enable
+bf16: true
+
+# Full BF16 evaluation (equivalent to bf16_full_eval in HuggingFace Trainer)
+bf16: full
+```
+
+<Tip>
+Use `bf16: auto` when you are unsure whether your GPU supports BF16. Axolotl will enable it automatically on Ampere (A100, RTX 30/40 series) and newer hardware.
+</Tip>
+
+---
+
+## FP16
+
+FP16 is supported on older GPU generations (Pascal and above) but is less numerically stable than BF16. You may need to tune hyperparameters to prevent loss spikes.
+
+```yaml
+fp16: true
+```
+
+### FP16 considerations
+
+- May require gradient scaling to prevent underflow
+- More prone to training instability than BF16, especially with certain architectures
+- Use BF16 instead whenever your hardware supports it
+
+---
+
+## FP8
+
+FP8 delivers significant speed and memory improvements on NVIDIA Hopper+ GPUs. Axolotl's implementation uses PyTorch's TorchAO library with tensorwise scaling.
+
+<Note>
+FP8 support is experimental. It requires compatible hardware and software versions.
+</Note>
+
+### Requirements
+
+| Requirement | Minimum version |
+|-------------|----------------|
+| GPU | NVIDIA Hopper (H100, H200) or newer |
+| PyTorch | 2.7+ |
+| CUDA | 12.4+ |
+
+### Basic FP8 config
+
+```yaml
+fp8: true
+torch_compile: true   # critical — see warning below
+```
+
+<Warning>
+`torch_compile: true` is required for FP8 to deliver meaningful speedups. Without compilation, FP8 may be slower and use more memory than BF16.
+</Warning>
+
+### FP8 with FSDP2
+
+FP8 training can be combined with FSDP2 for multi-GPU runs. Enabling `fp8_enable_fsdp_float8_all_gather` moves the FSDP `all_gather` communication to FP8 precision for additional savings.
+
+```yaml
+fp8: true
+fp8_enable_fsdp_float8_all_gather: true
+torch_compile: true
+
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  cpu_ram_efficient_loading: true
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  state_dict_type: FULL_STATE_DICT
+  reshard_after_forward: true
+```
+
+Enabling FP8 + FP8 all-gather results in approximately 10% faster iterations per second compared to BF16 for a 3B parameter model.
+
+### FP8 supported training modes
+
+| Mode | Supported |
+|------|:---------:|
+| Single GPU | Yes |
+| Multi-GPU with FSDP2 | Yes |
+| Multi-GPU with DeepSpeed | Yes |
+| DDP + `torch.compile` | No (causes errors) |
+
+### Known limitations
+
+- FP8 + FSDP2 + `torch.compile` + FSDP2 activation checkpointing tends to be slower than the BF16 equivalent
+- Flash Attention 2 does not play well with `torch.compile`
+
+See `examples/llama-3/3b-fp8-fsdp2.yaml` in the Axolotl repository for an optimized reference configuration.
+
+---
+
+## Choosing the right precision
+
+| Hardware | Recommended format |
+|----------|-------------------|
+| Hopper+ (H100, H200) | FP8 + torch.compile for max speed; BF16 otherwise |
+| Ampere (A100, RTX 30/40 series) | BF16 |
+| Turing / Pascal GPUs | FP16 |
+| Very old or unsupported GPUs | FP32 |
+
+---
+
+## Quantization Aware Training (QAT)
+
+QAT simulates quantization effects during training so the model adapts to lower-precision arithmetic before it is actually quantized. This typically improves the accuracy of the final quantized model.
+
+QAT is implemented via torchao. Refer to the QAT documentation for full configuration details.
+
+---
+
+## Validating your mixed precision setup
+
+Before running a full training job with a new precision setting, validate stability:
+
+<Steps>
+  <Step title="Use a small dataset">
+    Run a short experiment (a few hundred steps) to check that loss behaves as expected.
+  </Step>
+  <Step title="Monitor loss curves">
+    Look for irregularities such as loss spikes, NaN values, or sudden divergence — especially common with FP16.
+  </Step>
+  <Step title="Compare with a baseline">
+    When evaluating FP8 or FP16, run a BF16 baseline first to establish a reference loss trajectory.
+  </Step>
+  <Step title="Check evaluation metrics">
+    Ensure that downstream evaluation metrics (perplexity, task accuracy) match expectations after training.
+  </Step>
+</Steps>
+
+---
+
+## TF32
+
+On Ampere and newer GPUs, PyTorch uses TF32 by default for matrix multiplications and convolutions. This gives near-BF16 speed with FP32 range. You can explicitly control this behavior:
+
+```yaml
+tf32: true    # enable TF32 (default on Ampere+)
+```

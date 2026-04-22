@@ -1,0 +1,345 @@
+---
+title: "Multi-GPU Training with DeepSpeed and FSDP"
+description: "Scale Axolotl training across multiple GPUs using DeepSpeed ZeRO stages, FSDP1/FSDP2, DDP, sequence parallelism, and N-D parallelism."
+keywords: ["multi-gpu", "deepspeed", "zero", "fsdp", "fsdp2", "ddp", "sequence parallelism", "tensor parallelism"]
+---
+
+Axolotl supports three mutually exclusive sharding strategies for multi-GPU training: DeepSpeed, FSDP, and DDP. Additional features such as sequence parallelism, FSDP + QLoRA, and N-D parallelism can be layered on top of these strategies.
+
+<Note>
+You cannot combine DeepSpeed, FSDP, and DDP with each other. Choose one strategy for your run.
+</Note>
+
+## DeepSpeed
+
+DeepSpeed implements the ZeRO (Zero Redundancy Optimizer) family of algorithms, which shard optimizer states, gradients, and model parameters across GPUs in progressively more aggressive stages.
+
+### Configuration
+
+Add the path to a DeepSpeed JSON config in your YAML:
+
+```yaml
+deepspeed: deepspeed_configs/zero2.json
+```
+
+### Launch commands
+
+```bash
+# Fetch the bundled DeepSpeed configs (run once)
+axolotl fetch deepspeed_configs
+
+# Train with the config-specified deepspeed file
+axolotl train config.yaml
+
+# Override deepspeed config from the CLI
+axolotl train config.yaml --deepspeed deepspeed_configs/zero3.json
+```
+
+### ZeRO stages
+
+Axolotl ships default JSON configs for each stage. Start with Stage 1 and move to higher stages only if you run out of VRAM.
+
+<Tip>
+Choose the stage that offloads the least amount to memory while still fitting in VRAM. Lower stages have less communication overhead and run faster.
+</Tip>
+
+| Config file | Description |
+|-------------|-------------|
+| `zero1.json` | ZeRO Stage 1 — shards optimizer states |
+| `zero1_torch_compile.json` | Stage 1 + torch compile |
+| `zero2.json` | ZeRO Stage 2 — shards optimizer states and gradients |
+| `zero3.json` | ZeRO Stage 3 — shards optimizer states, gradients, and parameters |
+| `zero3_bf16.json` | Stage 3 with bf16 |
+| `zero3_bf16_cpuoffload_params.json` | Stage 3 + CPU offload for parameters |
+| `zero3_bf16_cpuoffload_all.json` | Stage 3 + CPU offload for parameters and optimizer |
+
+---
+
+## Fully Sharded Data Parallel (FSDP)
+
+FSDP is PyTorch's native implementation of ZeRO-style sharding and is the recommended strategy for new training runs.
+
+<Note>
+FSDP2 is recommended for all new users. FSDP1 is deprecated and will be removed in an upcoming Axolotl release.
+</Note>
+
+### FSDP2 configuration
+
+```yaml
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  cpu_ram_efficient_loading: true
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  state_dict_type: FULL_STATE_DICT
+  reshard_after_forward: true    # ZeRO-3; set false for ZeRO-2
+```
+
+### Migrating from FSDP1 to FSDP2
+
+Use the field mapping below to update your config. Fields marked **REMOVED** have no equivalent in FSDP2.
+
+| FSDP1 field | FSDP2 equivalent |
+|-------------|-----------------|
+| `fsdp_sharding_strategy` | `reshard_after_forward` |
+| `fsdp_backward_prefetch_policy` | **REMOVED** |
+| `fsdp_backward_prefetch` | **REMOVED** |
+| `fsdp_forward_prefetch` | **REMOVED** |
+| `fsdp_sync_module_states` | **REMOVED** |
+| `fsdp_cpu_ram_efficient_loading` | `cpu_ram_efficient_loading` |
+| `fsdp_state_dict_type` | `state_dict_type` |
+| `fsdp_use_orig_params` | **REMOVED** |
+| `fsdp_activation_checkpointing` | `activation_checkpointing` |
+
+<Tabs>
+  <Tab title="FSDP1 (old)">
+    ```yaml
+    fsdp_version: 1
+    fsdp_config:
+      fsdp_offload_params: false
+      fsdp_cpu_ram_efficient_loading: true
+      fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+      fsdp_transformer_layer_cls_to_wrap: Qwen3DecoderLayer
+      fsdp_state_dict_type: FULL_STATE_DICT
+      fsdp_sharding_strategy: FULL_SHARD
+    ```
+  </Tab>
+  <Tab title="FSDP2 (new)">
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      offload_params: false
+      cpu_ram_efficient_loading: true
+      auto_wrap_policy: TRANSFORMER_BASED_WRAP
+      transformer_layer_cls_to_wrap: Qwen3DecoderLayer
+      state_dict_type: FULL_STATE_DICT
+      reshard_after_forward: true
+    ```
+  </Tab>
+</Tabs>
+
+### FSDP + QLoRA
+
+FSDP can be combined with QLoRA to fine-tune large models (70B+) on consumer GPUs. For example, a 70B model can be trained on two 24 GB GPUs.
+
+<Steps>
+  <Step title="Set the adapter to qlora">
+    ```yaml
+    adapter: qlora
+    ```
+  </Step>
+  <Step title="Enable FSDP2">
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      offload_params: false
+      cpu_ram_efficient_loading: true
+      auto_wrap_policy: TRANSFORMER_BASED_WRAP
+      transformer_layer_cls_to_wrap: LlamaDecoderLayer
+      state_dict_type: FULL_STATE_DICT
+      reshard_after_forward: true
+    ```
+  </Step>
+  <Step title="Use a supported model">
+    Currently supported: `llama`, `mistral`, `mixtral`.
+  </Step>
+</Steps>
+
+If you still run out of VRAM after enabling CPU offloading, you can allow FSDP to spill to disk swap by disabling memory pinning:
+
+```yaml
+fsdp_config:
+  offload_params: true
+  cpu_offload_pin_memory: false   # allows use of disk swap as fallback
+```
+
+### FSDP1 (deprecated)
+
+<Warning>
+The `fsdp` list-style config is deprecated. Use `fsdp_config` with `fsdp_version: 2` instead.
+</Warning>
+
+```yaml
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_offload_params: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+```
+
+---
+
+## DDP (Distributed Data Parallel)
+
+DDP is the default strategy when neither DeepSpeed nor FSDP is configured. It replicates the full model on every GPU and averages gradients after each backward pass. Use DDP when your model fits comfortably on a single GPU and you want simple data-parallel scaling.
+
+No additional configuration is required — run with multiple GPUs and Axolotl will use DDP automatically.
+
+---
+
+## Sequence parallelism
+
+Sequence parallelism splits long input sequences across GPUs using the [ring-flash-attention](https://github.com/zhuzilin/ring-flash-attention) protocol. This allows you to train with sequence lengths that would otherwise cause out-of-memory errors.
+
+### Requirements
+
+```bash
+pip install axolotl[ring-flash-attn]
+```
+
+Flash Attention must also be enabled: `flash_attention: true`.
+
+### Configuration
+
+```yaml
+flash_attention: true
+
+# Split sequences across N GPUs (must be a divisor of total GPU count)
+context_parallel_size: 4
+
+# Optional: stride across the key dimension (larger = faster but more memory)
+heads_k_stride: 1
+
+# Optional: attention function ("varlen_llama3" or "batch_ring")
+# Defaults to "varlen_llama3" when sample_packing: true
+ring_attn_func:
+```
+
+<Note>
+Sequence parallelism reduces your effective global batch size. With 8 GPUs and `context_parallel_size: 4`, only 2 independent batches are processed per step instead of 8.
+</Note>
+
+Sequence parallelism is compatible with DDP, DeepSpeed, and FSDP, and works together with sample packing.
+
+---
+
+## N-D parallelism (beta)
+
+N-D parallelism lets you compose multiple parallelism strategies simultaneously using PyTorch's `DeviceMesh`. This is useful when a single strategy is not enough to address all bottlenecks.
+
+### Core concepts
+
+<AccordionGroup>
+  <Accordion title="Data Parallelism (FSDP / DDP)">
+    FSDP shards model parameters, gradients, and optimizer states across GPUs. With `reshard_after_forward: true` this is equivalent to ZeRO-3; with `false`, it is ZeRO-2.
+
+    DDP replicates the full model on every GPU and is suitable when each GPU can hold the full model.
+  </Accordion>
+
+  <Accordion title="Tensor Parallelism (TP)">
+    Splits individual layers across GPUs. For a linear layer `Y = XA`, the weight matrix is split column-wise and each GPU computes a slice of the output. Requires a very fast GPU interconnect (NVLink) and is not recommended across nodes.
+  </Accordion>
+
+  <Accordion title="Context Parallelism (CP)">
+    Also called sequence parallelism. Each GPU handles a chunk of the input sequence. A ring communication pattern (ring-flash-attention) ensures every GPU attends to the full sequence context.
+  </Accordion>
+
+  <Accordion title="Hybrid Sharding Data Parallel (HSDP)">
+    Combines FSDP within a node (fast NVLink) with DDP across nodes (slower inter-node network). Well-suited for multi-node training.
+  </Accordion>
+</AccordionGroup>
+
+### Configuration
+
+```yaml
+# FSDP base config (required for N-D parallelism)
+fsdp_version: 2
+fsdp_config:
+  reshard_after_forward: true
+  # ... other fsdp options
+
+# FSDP sharding group size (ZeRO-3 dimension)
+dp_shard_size: 4
+
+# DDP replication count (cross-node dimension)
+dp_replicate_size: 2
+
+# Tensor parallelism GPU count (default: 1 = disabled)
+tensor_parallel_size: 1
+
+# Context/sequence parallelism GPU count (default: 1 = disabled)
+context_parallel_size: 1
+```
+
+<Note>
+DeepSpeed is only compatible with `tensor_parallel_size`. For other N-D combinations, use FSDP.
+</Note>
+
+### Support matrix
+
+| Combination | `dp_replicate` | `dp_shard` | `tp_size` | `cp_size` | Status |
+|-------------|:-:|:-:|:-:|:-:|--------|
+| FSDP (ZeRO-3) | 1 | >1 | 1 | 1 | Fully supported |
+| HSDP | >1 | >1 | 1 | 1 | Fully supported |
+| FSDP + TP | 1 | >1 | >1 | 1 | Supported |
+| HSDP + TP | >1 | >1 | >1 | 1 | Supported |
+| FSDP + CP | 1 | >1 | 1 | >1 | Supported |
+| FSDP + TP + CP | 1 | >1 | >1 | >1 | Supported |
+| DDP + TP/CP | >1 | 1 | >1 | >1 | Not supported |
+
+### Examples
+
+<AccordionGroup>
+  <Accordion title="HSDP on 2 nodes, 4 GPUs each (8 GPUs total)">
+    FSDP within each node, DDP across nodes:
+
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      reshard_after_forward: true
+    dp_shard_size: 4
+    dp_replicate_size: 2
+    ```
+  </Accordion>
+
+  <Accordion title="FSDP + TP on a single 8-GPU node">
+    Shard the model across 4 GPUs with FSDP, split each layer across 2 GPUs with TP:
+
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      reshard_after_forward: true
+    dp_shard_size: 4
+    tensor_parallel_size: 2
+    ```
+  </Accordion>
+
+  <Accordion title="FSDP + CP on a single 8-GPU node for long context">
+    Shard the model and split sequences across all 8 GPUs:
+
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      reshard_after_forward: true
+    dp_shard_size: 8
+    context_parallel_size: 8
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Out-of-memory errors">
+    - Reduce `micro_batch_size`
+    - Reduce `eval_batch_size`
+    - Increase `gradient_accumulation_steps`
+    - Move to a higher DeepSpeed ZeRO stage, or enable FSDP CPU offload
+    - Enable `gradient_checkpointing: true`
+  </Accordion>
+
+  <Accordion title="Training instability">
+    - Start with DeepSpeed ZeRO-2 and confirm stable loss before scaling to ZeRO-3
+    - Monitor loss values and check learning rates
+    - Try `bf16: auto` instead of `fp16: true`
+  </Accordion>
+
+  <Accordion title="NCCL errors">
+    For NCCL-related network issues in multi-GPU environments, check that all GPUs can communicate and that NCCL environment variables are set correctly. See the NCCL troubleshooting guide in the Axolotl documentation.
+  </Accordion>
+</AccordionGroup>

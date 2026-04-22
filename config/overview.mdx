@@ -1,0 +1,110 @@
+---
+title: "Axolotl Configuration File Overview"
+description: "Learn how Axolotl's YAML-driven config system works, what each major section controls, and how to write your first complete training config."
+---
+
+Every Axolotl training run is defined by a single YAML configuration file. Instead of writing Python scripts, you describe your model, adapter, dataset, and hyperparameters declaratively, and then pass that file to any CLI command. This makes experiments reproducible, easy to version-control, and shareable with teammates without any code changes.
+
+## Minimal complete config
+
+The following example shows the smallest valid configuration for a supervised fine-tuning run using a LoRA adapter on a publicly available model:
+
+```yaml
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_linear: true
+
+datasets:
+  - path: mhenrichsen/alpaca_data_cleaned
+    type: alpaca
+
+sequence_len: 2048
+sample_packing: true
+
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+num_epochs: 3
+learning_rate: 2e-4
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+
+output_dir: ./outputs/lora-out
+```
+
+Pass this to the CLI to start training:
+
+```bash
+axolotl train config.yml
+```
+
+## Major configuration sections
+
+The YAML file is organized into five functional areas. Each is documented in its own reference page.
+
+<CardGroup cols={2}>
+  <Card title="Model" icon="cube" href="/config/model">
+    Set `base_model`, `model_type`, precision flags (`bf16`, `fp16`), attention implementation, and `trust_remote_code`.
+  </Card>
+  <Card title="Adapters" icon="layer-group" href="/config/adapters">
+    Configure `adapter` type (LoRA, QLoRA, full fine-tune), rank, target modules, and bitsandbytes quantization.
+  </Card>
+  <Card title="Datasets" icon="database" href="/config/datasets">
+    Specify one or more datasets with `path`, `type`, `split`, and control preprocessing with `dataset_prepared_path`.
+  </Card>
+  <Card title="Training" icon="bolt" href="/config/training">
+    Tune `micro_batch_size`, `learning_rate`, `optimizer`, `lr_scheduler`, checkpointing, and logging.
+  </Card>
+</CardGroup>
+
+## How config loading works
+
+<Steps>
+  <Step title="Write your YAML file">
+    Start from an example (`axolotl fetch examples`) or write from scratch. The config file can be local or a URL to a raw YAML file.
+  </Step>
+  <Step title="Validate with preprocess">
+    Run `axolotl preprocess config.yml` to tokenize your dataset and catch validation errors before committing GPU time.
+  </Step>
+  <Step title="Train">
+    Run `axolotl train config.yml`. Config values can also be overridden directly on the command line — for example, `--learning-rate 1e-4`.
+  </Step>
+  <Step title="Iterate">
+    Use `axolotl train config.yml --sweep sweep.yml` to run a grid search over any set of hyperparameters automatically.
+  </Step>
+</Steps>
+
+## CLI overrides
+
+Any config key can be overridden at the command line using its YAML name in dash-case:
+
+```bash
+axolotl train config.yml \
+  --learning-rate 1e-4 \
+  --micro-batch-size 2 \
+  --num-epochs 3
+```
+
+<Note>
+CLI flag names use dashes (`--learning-rate`), while YAML keys use underscores (`learning_rate`). The legacy module-based CLI uses underscores for both.
+</Note>
+
+## Config discovery tools
+
+Two built-in commands help you explore available options:
+
+```bash
+# Dump the full JSON schema for all config fields
+axolotl config-schema
+
+# Show schema for a single field
+axolotl config-schema --field adapter
+
+# Show schema in YAML format
+axolotl config-schema --format yaml
+```
+
+AI coding agents can also use `axolotl agent-docs` to get a curated reference tailored to their task. See [AI Agent Documentation](/cli/agent-docs) for details.

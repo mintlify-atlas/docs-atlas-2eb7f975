@@ -1,0 +1,83 @@
+---
+title: "Telemetry and Usage Data in Axolotl"
+description: "Learn what anonymous usage data Axolotl collects, why it exists, how to opt out with AXOLOTL_DO_NOT_TRACK, and what privacy protections are in place."
+---
+
+Axolotl collects anonymous telemetry to help maintainers understand how the library is used and where users encounter problems. This data informs which features to prioritize, which models to optimize for, and which errors to fix. No personally identifiable information is collected.
+
+## What data is collected
+
+<CardGroup cols={2}>
+  <Card title="System information" icon="computer">
+    OS, Python version, Axolotl version, PyTorch version, Transformers version, and other library versions.
+  </Card>
+  <Card title="Hardware information" icon="microchip">
+    CPU count, system memory, GPU count, and GPU model names.
+  </Card>
+  <Card title="Runtime metrics" icon="chart-line">
+    Training progress, GPU memory usage, and timing information across the training run.
+  </Card>
+  <Card title="Usage patterns" icon="sliders">
+    Model types from a whitelisted set of organizations, and training configuration options used.
+  </Card>
+</CardGroup>
+
+Error tracking is also enabled: stack traces and error messages are captured and sanitized to remove personal information before transmission.
+
+## Privacy protections
+
+- **No PII collected.** Personally identifiable information is not collected.
+- **Path redaction.** All path-like config values (such as local file paths and output directories) are automatically redacted from telemetry data.
+- **Model whitelist.** Model information is only collected for a whitelisted set of organizations. See `axolotl/telemetry/whitelist.yaml` for the full list.
+- **Anonymous run IDs.** Each training run generates a unique anonymous ID that links telemetry events within the same run, without identifying the user or machine.
+- **Main process only.** Telemetry is only sent from the main process to prevent duplicate events in multi-GPU setups.
+
+## Opting out
+
+Telemetry is **enabled by default** on an opt-out basis. To disable it, set either of these environment variables before starting training:
+
+<Tabs>
+  <Tab title="Axolotl-specific variable">
+    ```bash
+    AXOLOTL_DO_NOT_TRACK=1 axolotl train config.yaml
+    ```
+
+    Or export it for the session:
+
+    ```bash
+    export AXOLOTL_DO_NOT_TRACK=1
+    ```
+  </Tab>
+  <Tab title="Generic DO_NOT_TRACK variable">
+    ```bash
+    DO_NOT_TRACK=1 axolotl train config.yaml
+    ```
+
+    This follows the [community standard](https://consoledonottrack.com/) for opt-out signals.
+  </Tab>
+</Tabs>
+
+### Suppressing the startup warning
+
+On startup, Axolotl logs a warning about telemetry to make sure you are aware data is being collected. This warning is displayed until you explicitly configure telemetry either way.
+
+To suppress the warning, set the variable explicitly instead of leaving it unset:
+
+| Value | Effect |
+|-------|--------|
+| `AXOLOTL_DO_NOT_TRACK=0` | Telemetry enabled, no warning shown |
+| `AXOLOTL_DO_NOT_TRACK=1` | Telemetry disabled, no warning shown |
+| *(unset)* | Telemetry enabled after 10-second delay, warning shown |
+
+<Note>
+  The telemetry system blocks training startup for 10 seconds when telemetry is neither explicitly enabled nor disabled. Setting `AXOLOTL_DO_NOT_TRACK=0` or `AXOLOTL_DO_NOT_TRACK=1` removes this delay.
+</Note>
+
+## Implementation details
+
+Telemetry is implemented using [PostHog](https://posthog.com/) and consists of the following components:
+
+- `axolotl.telemetry.TelemetryManager` — a singleton class that initializes the telemetry system and provides methods for tracking events
+- `axolotl.telemetry.errors.send_errors` — a decorator that captures exceptions and sends sanitized stack traces
+- `axolotl.telemetry.runtime_metrics.RuntimeMetricsTracker` — tracks runtime metrics during training
+- `axolotl.telemetry.callbacks.TelemetryCallback` — a Trainer callback that emits runtime metrics at the end of training steps

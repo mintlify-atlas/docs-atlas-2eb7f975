@@ -1,0 +1,397 @@
+---
+title: "Debugging and Training Stability in Axolotl"
+description: "Diagnose NaN loss, CUDA OOM errors, NCCL hangs, and tokenization issues in Axolotl. Includes VSCode and Docker debug setup guides."
+---
+
+Effective debugging in Axolotl requires both a good tooling setup and systematic strategies for narrowing down problems. This page covers how to inspect tokenized samples, diagnose training instability, resolve memory errors, configure VSCode and Docker for step-through debugging, and fix common multi-GPU issues.
+
+<Tip>
+  For RL-specific training metrics and reward diagnostics (GRPO entropy collapse, IS ratio divergence), see the training stability section below.
+</Tip>
+
+## General debugging tips
+
+Before reaching for specialized tools, simplify your test scenario as much as possible. These steps apply across all debugging situations:
+
+<Steps>
+  <Step title="Use the latest version of Axolotl">
+    This project changes frequently and bugs are fixed fast. Confirm you are on the latest `main` branch:
+
+    ```bash
+    git checkout main && git pull
+    ```
+  </Step>
+  <Step title="Eliminate concurrency">
+    Restrict to a single GPU and a single data preprocessing process:
+
+    ```bash
+    export CUDA_VISIBLE_DEVICES=0
+    ```
+
+    ```yaml
+    dataset_num_proc: 1
+    ```
+  </Step>
+  <Step title="Use a small dataset">
+    If you cannot construct a small dataset, shard a larger one:
+
+    ```yaml
+    datasets:
+      - path: my_dataset
+        shards: 20
+    ```
+
+    When using a small dataset, also set `sample_packing: false` and `eval_sample_packing: false` to avoid packing errors.
+  </Step>
+  <Step title="Use a small model">
+    [TinyLlama/TinyLlama-1.1B-Chat-v1.0](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0) is a reliable small model for testing.
+  </Step>
+  <Step title="Minimize iteration time">
+    Reduce these settings to make each training loop finish as quickly as possible:
+
+    ```yaml
+    micro_batch_size: 1
+    max_steps: 1
+    val_set_size: 0
+    ```
+  </Step>
+  <Step title="Clear caches">
+    Axolotl and HuggingFace both cache preprocessing outputs. Delete the `dataset_prepared_path` directory (default: `last_run_prepared`) and the relevant `~/.cache/huggingface/datasets/` folder to ensure data preprocessing runs from scratch.
+  </Step>
+</Steps>
+
+## Inspecting tokenized samples
+
+Use `axolotl preprocess --debug` to inspect how your dataset is tokenized and which tokens have loss computed on them. This is the fastest way to catch label masking issues, special token mismatches, or prompt formatting problems:
+
+```bash
+axolotl preprocess your_config.yml --debug
+```
+
+The debug output shows each token, its ID, and whether it is included in the loss computation. Compare this against what you expect to confirm your prompt strategy is working correctly.
+
+## Training stability
+
+### SFT stability
+
+Monitor these four metrics for every SFT run:
+
+| Metric | Healthy range | What to watch for |
+|--------|--------------|-------------------|
+| `train/loss` | Decreasing; 0.5–2.0 for chat | Plateau or spike |
+| `eval/loss` | Tracks train loss with small gap | Divergence signals overfitting |
+| `grad_norm` | 0.1–10.0 | Spikes above 100 indicate instability |
+| `learning_rate` | Follows expected schedule | Should show warmup then decay |
+
+**Loss plateau**: Loss stops decreasing early. Common causes: learning rate too low (try 2–5x increase), insufficient warmup (set `warmup_steps` to 5–10% of total steps), or incorrect label masking — verify with `axolotl preprocess --debug`.
+
+**Loss spikes**: Loss suddenly jumps 2–10x. Common causes: a malformed data sample, learning rate too high (reduce by 2–5x), or gradient accumulation mismatch (effective batch size = `micro_batch_size × gradient_accumulation_steps × num_gpus`).
+
+**Overfitting**: Train loss decreases but eval loss increases. Reduce `num_epochs`, increase `weight_decay`, lower `lora_r`, or add `lora_dropout: 0.05`.
+
+### GRPO/RL stability
+
+GRPO training logs a richer set of metrics:
+
+| Metric | Healthy range | Red flag |
+|--------|--------------|----------|
+| `rewards/*/mean` | > 0.15 within 20 steps | Stays at 0 — reward function broken or task too hard |
+| `reward_std` | > 0 on most steps | Always 0 — no learning signal |
+| `entropy` | 0.05–0.5 | < 0.01 suggests mode collapse |
+| `kl` | 0.0–0.5 | > 2.0 suggests policy diverged from reference |
+| `grad_norm` | 0.001–1.0 | > 10.0 is unstable |
+
+**Reward never increases**: Test your reward function standalone, check dataset columns are not accidentally removed by transforms, and enable `log_completions: true` in `trl:` to inspect generated outputs in W&B.
+
+**Entropy collapse (mode collapse)**: All completions become nearly identical. Increase `temperature` (try 0.8–1.0), reduce the learning rate, or add a KL penalty with the `beta` parameter.
+
+## NaN and Inf debugging
+
+<Steps>
+  <Step title="Enable anomaly detection">
+    This is slow but pinpoints the exact operation that produces NaN:
+
+    ```python
+    torch.autograd.set_detect_anomaly(True)
+    ```
+  </Step>
+  <Step title="Check grad_norm timing">
+    If `grad_norm` goes to NaN, the backward pass is the source. If loss is NaN but the previous step's `grad_norm` was fine, the forward pass is the source.
+  </Step>
+  <Step title="Reduce to single GPU, single batch">
+    Eliminate distributed training variables by setting `CUDA_VISIBLE_DEVICES=0` and `micro_batch_size: 1`.
+  </Step>
+  <Step title="Inspect the triggering batch">
+    Print the batch that causes NaN. Look for empty sequences, extreme token IDs, or unexpected padding patterns.
+  </Step>
+</Steps>
+
+<Note>
+  If you modify any Triton JIT kernel (such as FP8 quantization kernels), clear the Triton cache for changes to take effect: `rm -rf ~/.triton/cache`
+</Note>
+
+## OOM debugging
+
+Out-of-memory errors are the most common training failure. Work through these steps in order, from least to most disruptive:
+
+<Steps>
+  <Step title="Reduce batch size">
+    VRAM scales roughly linearly with batch size. Start with the minimum:
+
+    ```yaml
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16  # Increase to maintain effective batch size
+    ```
+
+    For GRPO, the logits tensor for policy logprob computation can be very large. Reduce `micro_batch_size` to 2–4.
+  </Step>
+  <Step title="Enable gradient checkpointing">
+    Trades compute for memory by recomputing activations during the backward pass:
+
+    ```yaml
+    gradient_checkpointing: true
+    gradient_checkpointing_kwargs:
+      use_reentrant: false
+    ```
+
+    <Warning>
+      Some configurations require `use_reentrant: true`: DeepSpeed ZeRO-3 and EBFT strided mode with flex_attention.
+    </Warning>
+  </Step>
+  <Step title="Use quantization">
+    Load the base model in reduced precision:
+
+    ```yaml
+    # 4-bit QLoRA
+    adapter: qlora
+    load_in_4bit: true
+
+    # 8-bit
+    load_in_8bit: true
+
+    # FP8 (saves ~50% model VRAM, same compute speed as bf16)
+    fp8: true
+    ```
+  </Step>
+  <Step title="Reduce sequence length">
+    ```yaml
+    sequence_len: 1024
+    ```
+
+    Memory scales quadratically with sequence length when using standard attention. For GRPO, also reduce `max_completion_length`.
+  </Step>
+  <Step title="Enable Flash Attention">
+    Reduces attention memory from O(n²) to O(n):
+
+    ```yaml
+    flash_attention: true
+    ```
+  </Step>
+  <Step title="Offload with DeepSpeed">
+    For extreme cases, offload optimizer states or parameters to CPU:
+
+    ```yaml
+    deepspeed: deepspeed_configs/zero3_bf16.json
+    ```
+  </Step>
+</Steps>
+
+### Profiling GPU memory
+
+Use `profiler_steps` to capture PyTorch profiler traces for specific steps:
+
+```yaml
+profiler_steps: [1, 2]
+```
+
+View traces in TensorBoard (`tensorboard --logdir output_dir/runs`) or open the `.json` trace file in `chrome://tracing`.
+
+## VSCode debugging setup
+
+### Prerequisites
+
+Install Axolotl in editable mode with dev dependencies:
+
+```bash
+export UV_TORCH_BACKEND=cu128  # or cu130
+uv sync --extra flash-attn --extra deepspeed --group dev --group test
+source .venv/bin/activate
+```
+
+### launch.json configuration
+
+The following config debugs data preprocessing for the `chat_template` format. Place it in `.vscode/launch.json`:
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug axolotl prompt - chat_template",
+            "type": "python",
+            "module": "accelerate.commands.launch",
+            "request": "launch",
+            "args": [
+                "-m", "axolotl.cli.train", "dev_chat_template.yml",
+                "--dataset_num_proc=1",
+                "--max_steps=1",
+                "--batch_size=1",
+                "--micro_batch_size=1",
+                "--val_set_size=0",
+                "--sample_packing=False",
+                "--eval_sample_packing=False",
+                "--dataset_prepared_path=temp_debug/axolotl_outputs/data",
+                "--output_dir=temp_debug/axolotl_outputs/model"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/devtools",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HF_HOME": "${workspaceFolder}/devtools/temp_debug/.hf-cache"
+            },
+            "preLaunchTask": "cleanup-for-dataprep"
+        }
+    ]
+}
+```
+
+Set `justMyCode: false` if you want to step into HuggingFace or other dependencies.
+
+### tasks.json for cache cleanup
+
+The `preLaunchTask` above references a task that deletes stale caches before each debug run. Place this in `.vscode/tasks.json`:
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "delete-outputs",
+            "type": "shell",
+            "command": "rm -rf temp_debug/axolotl_outputs",
+            "options": { "cwd": "${workspaceFolder}/devtools" },
+            "problemMatcher": []
+        },
+        {
+            "label": "delete-temp-hf-dataset-cache",
+            "type": "shell",
+            "command": "rm -rf temp_debug/.hf-cache/datasets",
+            "options": { "cwd": "${workspaceFolder}/devtools" },
+            "problemMatcher": []
+        },
+        {
+            "label": "cleanup-for-dataprep",
+            "dependsOn": ["delete-outputs", "delete-temp-hf-dataset-cache"]
+        }
+    ]
+}
+```
+
+<Tip>
+  Remove the `preLaunchTask` if you are debugging model training rather than data preprocessing — you do not want to delete the checkpoint cache between runs in that case.
+</Tip>
+
+### Remote hosts
+
+If developing on a remote host, use the [VSCode Remote SSH extension](https://code.visualstudio.com/docs/remote/ssh) to debug remotely. The launch.json config works identically over SSH.
+
+## Docker debugging
+
+### Starting the container
+
+On the host running Axolotl, clone the repo and start the container with the source mounted:
+
+```bash
+git clone https://github.com/axolotl-ai-cloud/axolotl
+cd axolotl
+docker run --privileged --gpus '"all"' --shm-size 10g --rm -it \
+  --name axolotl --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  --mount type=bind,src="${PWD}",target=/workspace/axolotl \
+  -v ${HOME}/.cache/huggingface:/root/.cache/huggingface \
+  axolotlai/axolotl-uv:main-latest
+```
+
+Then install dev dependencies inside the container:
+
+```bash
+uv sync --extra flash-attn --extra deepspeed --group dev --group test
+source .venv/bin/activate
+```
+
+### Attaching VSCode to the container
+
+Open the command palette (`Cmd+Shift+P`) and select **Dev Containers: Attach to Running Container...**. Select the `axolotl` container. VSCode will attach and open the project root. Changes you make to the code are reflected both in the container and on the host via the bind mount.
+
+From here, use the same VSCode launch.json configuration described above.
+
+## Multi-GPU and NCCL issues
+
+Multi-GPU training failures often manifest as hangs rather than explicit errors. Enable NCCL debug output to diagnose them:
+
+```bash
+NCCL_DEBUG=INFO axolotl train config.yaml 2>&1 | tee /tmp/training.log
+```
+
+Common multi-GPU issues:
+
+- **Training hangs indefinitely**: Usually a GPU communication problem. Check the NCCL debug output for timeout or connection errors.
+- **`RuntimeError: NCCL communicator was aborted`**: Network or GPU failure. Check `NCCL_DEBUG=INFO` output for the underlying cause.
+- **`async_prefetch` deadlock with FSDP**: Set `async_prefetch: false` when using FSDP or DeepSpeed multi-GPU.
+
+## Debug logging
+
+For detailed Axolotl-internal debug output, set `AXOLOTL_LOG_LEVEL=DEBUG`:
+
+```bash
+AXOLOTL_LOG_LEVEL=DEBUG axolotl train config.yaml 2>&1 | tee /tmp/training.log
+```
+
+Always pipe training output to a log file so you can inspect it after the run.
+
+## Common errors
+
+<AccordionGroup>
+  <Accordion title="exitcode: -9">
+    System RAM exhaustion. Reduce dataset size, lower `dataset_num_proc`, or reduce the number of data workers.
+  </Accordion>
+  <Accordion title="exitcode: -7 (DeepSpeed)">
+    DeepSpeed version issue. Upgrade with: `pip install -U deepspeed`
+  </Accordion>
+  <Accordion title="CUDA out of memory">
+    GPU VRAM exhaustion. Follow the OOM debugging steps above, starting with reducing `micro_batch_size`.
+  </Accordion>
+  <Accordion title="'DummyOptim' object has no attribute 'step'">
+    DeepSpeed configured on a single GPU. Remove the `deepspeed:` section from your config or the `--deepspeed` CLI flag.
+  </Accordion>
+  <Accordion title="ValueError: Asking to pad but the tokenizer does not have a padding token">
+    The tokenizer has no pad token. Add one in your config:
+
+    ```yaml
+    special_tokens:
+      pad_token: "<|endoftext|>"
+    ```
+  </Accordion>
+  <Accordion title="unable to load strategy X / None is not callable">
+    The reward module is not importable. Run `cd experiments && python -c "import my_rewards"` to check for import errors.
+  </Accordion>
+  <Accordion title="CheckpointError (tensor count mismatch)">
+    Non-reentrant checkpointing combined with ZeRO-3 or flex_attention. Set `use_reentrant: true` in `gradient_checkpointing_kwargs`.
+  </Accordion>
+  <Accordion title="Content end boundary is before start boundary">
+    Chat template parsing issue. Check that `eos_token` matches your template. File a GitHub issue if the problem persists.
+  </Accordion>
+  <Accordion title="Data processing error: CAS service error">
+    HuggingFace XET issue. Disable XET with: `export HF_HUB_DISABLE_XET=1`
+  </Accordion>
+  <Accordion title="Received mismatch error on merge adapters (torch.Size mismatch)">
+    Likely a vocab size mismatch. By default, Axolotl expands model embeddings if the tokenizer has more tokens than the model. Use `axolotl merge-lora` rather than custom scripts to avoid this.
+  </Accordion>
+  <Accordion title="generation_batch_size not divisible by num_generations">
+    `micro_batch_size` is too small. Set `micro_batch_size` to be at least equal to `num_generations` and make it evenly divisible.
+  </Accordion>
+  <Accordion title="vLLM is not working with Axolotl">
+    Use torch 2.6.0 for vLLM compatibility. For Docker, use the `main-py3.11-cu124-2.6.0` tag.
+  </Accordion>
+</AccordionGroup>

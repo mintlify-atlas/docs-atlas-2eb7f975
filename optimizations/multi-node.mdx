@@ -1,0 +1,163 @@
+---
+title: "Multi-Node Distributed Training in Axolotl"
+description: "Set up multi-node training with torchrun or Ray, including networking requirements, environment variables, and FSDP configuration."
+keywords: ["multi-node", "torchrun", "ray", "distributed training", "MASTER_ADDR", "NCCL", "infiniband"]
+---
+
+Multi-node training lets you scale across multiple machines when a single node's GPU memory or compute capacity is insufficient. Axolotl supports three approaches: Accelerate-managed FSDP, torchrun, and Ray Train.
+
+<Warning>
+Every machine must have an identical copy of Axolotl installed (ideally the same commit) and the same YAML configuration file. The head node must be reachable by all other nodes on the configured port.
+</Warning>
+
+---
+
+## Approach 1: Accelerate (FSDP)
+
+Accelerate provides a high-level launcher that manages the rendezvous and process group setup. This is the simplest option when using FSDP.
+
+<Steps>
+  <Step title="Create an Accelerate config">
+    Run `accelerate config` and follow the prompts, or place the following file at `~/.cache/huggingface/accelerate/default_config.yaml`:
+
+    ```yaml
+    compute_environment: LOCAL_MACHINE
+    debug: false
+    distributed_type: FSDP
+    downcast_bf16: 'no'
+    machine_rank: 0           # 0 for the main machine; increment by 1 for each additional node
+    main_process_ip: 10.0.0.4 # IP of the main machine
+    main_process_port: 5000
+    main_training_function: main
+    mixed_precision: bf16
+    num_machines: 2           # total number of nodes
+    num_processes: 4          # total number of GPUs across all nodes
+    rdzv_backend: static
+    same_network: true
+    tpu_env: []
+    tpu_use_cluster: false
+    tpu_use_sudo: false
+    use_cpu: false
+    ```
+
+    <Note>
+    Set `num_processes` to the total GPU count across all nodes. For example, 2 nodes × 4 GPUs = `num_processes: 8`.
+    </Note>
+  </Step>
+
+  <Step title="Configure FSDP in your Axolotl YAML">
+    ```yaml
+    fsdp_version: 2
+    fsdp_config:
+      offload_params: true
+      state_dict_type: FULL_STATE_DICT
+      auto_wrap_policy: TRANSFORMER_BASED_WRAP
+      transformer_layer_cls_to_wrap: LlamaDecoderLayer
+      reshard_after_forward: true
+    ```
+  </Step>
+
+  <Step title="Launch on each machine">
+    Run `axolotl train config.yaml` (or `accelerate launch`) on every machine. The processes coordinate automatically once all nodes have launched.
+  </Step>
+</Steps>
+
+---
+
+## Approach 2: Torchrun
+
+Torchrun is the recommended approach when using Infiniband, as it can take full advantage of the available bandwidth.
+
+### NCCL environment variables for Infiniband
+
+Set these variables on every node before launching (adjust interface names for your network):
+
+```bash
+export NCCL_IB_DISABLE=0
+export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
+export NCCL_BUFFSIZE=2097152
+```
+
+### Launch commands
+
+Run one of the following on **every node**:
+
+<Tabs>
+  <Tab title="Axolotl CLI (recommended)">
+    ```bash
+    axolotl train config.yaml --launcher torchrun -- \
+      --nnodes $num_nodes \
+      --nproc_per_node $gpu_per_node \
+      --rdzv_id $rdzv_id \
+      --rdzv_backend c10d \
+      --rdzv_endpoint "$head_node_ip:$head_node_port"
+    ```
+  </Tab>
+  <Tab title="Direct torchrun (legacy)">
+    ```bash
+    torchrun \
+      --nnodes $num_nodes \
+      --nproc_per_node $gpu_per_node \
+      --rdzv_id $rdzv_id \
+      --rdzv_backend c10d \
+      --rdzv_endpoint "$head_node_ip:$head_node_port" \
+      -m axolotl.cli.train config.yaml
+    ```
+  </Tab>
+</Tabs>
+
+### Variable reference
+
+| Variable | Description |
+|----------|-------------|
+| `num_nodes` | Total number of nodes (machines) |
+| `gpu_per_node` | Number of GPUs per node |
+| `head_node_ip` | IP address of the head node, reachable by all other nodes |
+| `head_node_port` | Port on the head node (default: `29400`) |
+| `rdzv_id` | A unique job ID shared across all nodes for this run |
+
+<Tip>
+The Axolotl CLI approach (Option 1) is recommended because it provides consistent argument handling and integrates seamlessly with other Axolotl features.
+</Tip>
+
+---
+
+## Approach 3: Ray Train
+
+Ray Train provides a higher-level distributed training API with built-in job scheduling, fault tolerance, and multi-node management.
+
+See the [Ray integration documentation](https://github.com/axolotl-ai-cloud/axolotl) for full setup instructions.
+
+---
+
+## Networking requirements
+
+For any multi-node approach, ensure the following before starting a run:
+
+- All nodes can reach the head node at `$head_node_ip:$head_node_port`
+- Firewall rules permit inbound connections on the rendezvous port (default `29400`) and NCCL communication ports
+- All nodes run the same Axolotl version (pin to a commit for reproducibility)
+- All nodes have access to the same model weights and dataset (shared network filesystem or pre-downloaded)
+
+---
+
+## Recommended FSDP config for multi-node
+
+For multi-node FSDP with HSDP (FSDP within each node, DDP across nodes), use the following N-D parallelism config:
+
+```yaml
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  cpu_ram_efficient_loading: true
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  state_dict_type: FULL_STATE_DICT
+  reshard_after_forward: true
+
+# Example: 2 nodes × 8 GPUs = 16 total
+dp_shard_size: 8      # FSDP within each node
+dp_replicate_size: 2  # DDP across the 2 nodes
+```
+
+For a deeper explanation of how these dimensions interact, see the [multi-GPU guide](/optimizations/multi-gpu).

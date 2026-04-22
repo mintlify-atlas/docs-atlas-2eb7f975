@@ -1,0 +1,142 @@
+---
+title: "Quantization: GPTQ, QAT, and Post-Training"
+description: "Reduce model memory with torchao-powered quantization in Axolotl, covering post-training quantization and quantization-aware training with NVFP4 support."
+---
+
+Quantization reduces the memory footprint of your model by representing weights and activations in lower-precision numeric formats. Axolotl uses the [torchao](https://github.com/pytorch/ao) library for both post-training quantization (PTQ) and quantization-aware training (QAT). These techniques let you deploy larger models on hardware with limited VRAM, though they may affect accuracy depending on the quantization scheme chosen.
+
+<Note>
+  Axolotl does not currently support GGUF, GPTQ, or EXL2 quantization. The supported path is through torchao PTQ and QAT.
+</Note>
+
+## Quantization-aware training (QAT)
+
+QAT applies "fake" quantization to model weights (and optionally activations) during training. This exposes the model to quantization noise during the forward and backward passes, allowing it to compensate — so that when you later apply real quantization, accuracy loss is minimized compared to purely post-training quantization.
+
+For a deeper background, see the [torchao QAT documentation](https://github.com/pytorch/ao/tree/main/torchao/quantization/qat) and the [torchtune QAT tutorial](https://pytorch.org/torchtune/main/tutorials/qat_finetune.html).
+
+### Supported schemas
+
+Axolotl supports the following QAT schemas via torchao:
+
+- `Int4WeightOnly` — requires the `fbgemm-gpu` extra when installing Axolotl
+- `Int8DynamicActivationInt4Weight`
+- `Float8DynamicActivationFloat8Weight`
+- `Float8DynamicActivationInt4Weight`
+- `NVFP4` — NVIDIA FP4 format for use on Blackwell GPUs
+
+### Configuring QAT
+
+Add a `qat:` section to your training config:
+
+```yaml
+base_model: meta-llama/Llama-3.1-8B-Instruct
+adapter: lora
+
+qat:
+  activation_dtype: int8     # Optional. Valid values: "int4", "int8", "float8"
+  weight_dtype: int4         # Optional. Valid values: "int4", "fp8", "nvfp4"
+  group_size: 256            # Optional. Elements per group for per-group quantization
+  fake_quant_after_n_steps:  # Optional. Delay fake quantization N steps into training
+
+output_dir: ./outputs/qat-run
+```
+
+<Tip>
+  Delaying fake quantization with `fake_quant_after_n_steps` gives the model time to adapt to the task before quantization noise is introduced, which can improve final accuracy.
+</Tip>
+
+### NVFP4 example
+
+NVFP4 is NVIDIA's 4-bit floating point format, optimized for Blackwell GPU generation:
+
+```yaml
+qat:
+  weight_dtype: nvfp4
+  group_size: 16
+```
+
+## Post-training quantization (PTQ)
+
+PTQ quantizes a model after training is complete, without any retraining. For models trained with QAT, PTQ applies the real quantization that matches the fake quantization used during training.
+
+### Quantizing a QAT-trained model
+
+After QAT training finishes, run the `quantize` command using the same config file you used for training. This guarantees the quantization configuration matches exactly:
+
+```bash
+axolotl quantize qat.yml
+```
+
+The quantized model is saved to `{output_dir}/quantized`.
+
+### Quantize config reference
+
+The `quantization:` key is used for standalone PTQ (outside of a QAT training run):
+
+```yaml
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+quantization:
+  activation_dtype: int8     # Optional. Valid values: "int4", "int8", "float8"
+  weight_dtype: int8         # Optional. Valid values: "int4", "fp8", "nvfp4"
+  group_size: 32             # Optional. Elements per group for per-group quantization
+  quantize_embedding: false  # Optional. Whether to quantize the embedding layer
+
+output_dir: ./outputs/ptq-run
+```
+
+### Full QAT-then-PTQ workflow
+
+<Steps>
+  <Step title="Train with QAT config">
+    Run training with `qat:` set in your config:
+
+    ```bash
+    axolotl train qat.yml
+    ```
+  </Step>
+  <Step title="Quantize the trained model">
+    Pass the same config to the `quantize` command:
+
+    ```bash
+    axolotl quantize qat.yml
+    ```
+
+    The final checkpoint in `output_dir` is quantized and saved to `{output_dir}/quantized`.
+  </Step>
+  <Step title="Verify the output">
+    Confirm the quantized model was written to the expected directory:
+
+    ```bash
+    ls {output_dir}/quantized/
+    ```
+  </Step>
+</Steps>
+
+## Hub model naming
+
+<Note>
+  If you have configured hub pushing with `hub_model_id`, the quantization schema is automatically appended to the model name. For example, `axolotl-ai-cloud/qat-nvfp4-llama3B` becomes `axolotl-ai-cloud/qat-nvfp4-llama3B-nvfp4w`.
+</Note>
+
+## Choosing a quantization approach
+
+<CardGroup cols={2}>
+  <Card title="Use QAT when..." icon="graduation-cap">
+    You want the best accuracy at low bit-widths. QAT adds quantization noise during training so the model learns to compensate. Requires a training run with the `qat:` config key.
+  </Card>
+  <Card title="Use PTQ when..." icon="bolt">
+    You have a trained model and want to quantize it quickly without retraining. Best results when the model was already QAT-trained with a matching config.
+  </Card>
+</CardGroup>
+
+## Config key reference
+
+| Key | Section | Type | Default | Description |
+|-----|---------|------|---------|-------------|
+| `activation_dtype` | `qat:` / `quantization:` | str | `"int8"` | Fake quantization layout for activations. Options: `"int4"`, `"int8"`, `"float8"` |
+| `weight_dtype` | `qat:` / `quantization:` | str | `"int8"` | Fake quantization layout for weights. Options: `"int4"`, `"fp8"`, `"nvfp4"` |
+| `group_size` | `qat:` / `quantization:` | int | `32` | Elements per group for per-group quantization |
+| `fake_quant_after_n_steps` | `qat:` only | int | `None` | Steps before fake quantization begins |
+| `quantize_embedding` | `quantization:` only | bool | `false` | Whether to quantize the embedding layer |

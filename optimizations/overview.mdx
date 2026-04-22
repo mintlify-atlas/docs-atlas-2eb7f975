@@ -1,0 +1,258 @@
+---
+title: "Performance Optimizations in Axolotl"
+description: "A comprehensive overview of speed, memory, and scaling optimizations available in Axolotl, from flash attention to distributed training."
+keywords: ["optimizations", "flash attention", "gradient checkpointing", "sample packing", "liger kernel", "mixed precision"]
+---
+
+Axolotl includes a wide range of optimizations to increase training throughput, reduce VRAM consumption, and scale across multiple GPUs and nodes. This page provides a high-level overview of every major optimization category and links to detailed guides for each one.
+
+## Speed optimizations
+
+These techniques increase the number of training steps completed per second.
+
+### Attention implementations
+
+Choosing an optimized attention backend is the single most impactful speed change you can make. Only enable one backend at a time.
+
+<AccordionGroup>
+  <Accordion title="Flash Attention (recommended)">
+    Flash Attention 2, 3, and 4 are supported. Axolotl automatically selects the best available version based on your installed packages and GPU.
+
+    ```yaml
+    flash_attention: true
+    ```
+
+    | Version | GPU requirement | Notes |
+    |---------|----------------|-------|
+    | Flash Attention 2 | Ampere, Ada, or Hopper | Install: `pip install flash-attn --no-build-isolation` |
+    | Flash Attention 3 | Hopper only (CUDA 12.8+) | Install from source |
+    | Flash Attention 4 | Hopper or Blackwell | Install: `pip install flash-attn-4` |
+
+    <Tip>Flash Attention is required for sample packing to achieve maximum GPU utilization.</Tip>
+  </Accordion>
+
+  <Accordion title="Flex Attention">
+    A flexible PyTorch API for attention. Combine with `torch.compile` for best performance.
+
+    ```yaml
+    flex_attention: true
+    torch_compile: true
+    ```
+  </Accordion>
+
+  <Accordion title="SDP Attention">
+    PyTorch's native scaled dot product attention. A solid default when flash-attn is not available.
+
+    ```yaml
+    sdp_attention: true
+    ```
+  </Accordion>
+
+  <Accordion title="xFormers">
+    Facebook's memory-efficient attention implementation. Recommended for Turing GPUs and below.
+
+    ```yaml
+    xformers_attention: true
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Sample packing (multipack)
+
+Sample packing improves GPU utilization by combining multiple short sequences into a single packed sequence, eliminating padding waste.
+
+```yaml
+sample_packing: true
+flash_attention: true   # required for highest efficiency
+```
+
+With Flash Attention, sequences are concatenated into a single batch of size 1 and `cu_seqlens` offsets tell Flash Attention where each sequence starts, so there is no cross-sequence attention leakage.
+
+### LoRA kernel optimizations
+
+Fused Triton kernels accelerate LoRA fine-tuning through operator fusion on MLP, QKV, and output projections.
+
+```yaml
+lora_mlp_kernel: true
+lora_qkv_kernel: true
+lora_o_kernel: true
+```
+
+See the [LoRA kernel optimizations guide](/optimizations/lora-optims) for compatibility details.
+
+---
+
+## Memory optimizations
+
+These techniques reduce peak VRAM usage so you can fit larger models or use bigger batch sizes.
+
+### Parameter-efficient fine-tuning (LoRA / QLoRA)
+
+The most effective memory reduction strategy. Only a small set of adapter parameters are trained instead of the full model.
+
+```yaml
+adapter: lora      # or qlora for 4-bit base model
+load_in_4bit: true # for QLoRA
+```
+
+### Gradient checkpointing and activation offloading
+
+Gradient checkpointing re-computes activations during the backward pass instead of storing them, trading compute for VRAM.
+
+```yaml
+gradient_checkpointing: true
+
+# Optional: offload activations to CPU (or disk)
+activation_offloading: true    # streams to CPU with CUDA overlap
+# activation_offloading: disk  # offloads to disk for very long contexts
+```
+
+### Layer offloading
+
+Moves frozen decoder layer parameters to CPU and streams them back to GPU one layer at a time. Especially effective for LoRA/QLoRA where most weights are frozen.
+
+```yaml
+layer_offloading: true
+```
+
+### Mixed precision
+
+Lower precision formats reduce memory usage and can increase throughput significantly.
+
+- `bf16: auto` — recommended for Ampere+ GPUs
+- `fp16: true` — supported on older hardware
+- `fp8: true` + `torch_compile: true` — for Hopper+ (H100/H200) with maximum speed
+
+See the [mixed precision guide](/optimizations/mixed-precision) for configuration details.
+
+---
+
+## Custom kernels
+
+<CardGroup cols={2}>
+  <Card title="Liger Kernels" icon="bolt">
+    Triton kernels providing up to 20% throughput increase and 60% memory reduction. Supports FSDP and DeepSpeed.
+
+    ```yaml
+    plugins:
+      - axolotl.integrations.liger.LigerPlugin
+    liger_rope: true
+    liger_rms_norm: true
+    liger_glu_activation: true
+    liger_fused_linear_cross_entropy: true
+    ```
+  </Card>
+
+  <Card title="Cut Cross Entropy" icon="scissors">
+    Reduces VRAM during loss calculation by optimizing the cross-entropy operation over large vocabularies.
+
+    ```yaml
+    plugins:
+      - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+    ```
+  </Card>
+
+  <Card title="ScatterMoE" icon="network-wired">
+    Triton-based MoE kernel with fused LoRA support. Works on any CUDA GPU.
+
+    ```yaml
+    plugins:
+      - axolotl.integrations.kernels.KernelsPlugin
+    use_kernels: true
+    use_scattermoe: true
+    ```
+  </Card>
+
+  <Card title="SonicMoE" icon="microchip">
+    CUTLASS-based MoE kernel for NVIDIA Hopper and Blackwell GPUs. Higher throughput for large MoE models.
+
+    ```yaml
+    plugins:
+      - axolotl.integrations.kernels.KernelsPlugin
+    use_kernels: true
+    use_sonicmoe: true
+    ```
+  </Card>
+</CardGroup>
+
+---
+
+## Long-context training
+
+### RoPE scaling
+
+Extend a model's context window by interpolating Rotary Position Embeddings.
+
+```yaml
+overrides_of_model_config:
+  rope_scaling:
+    type: linear
+    factor: 4.0
+```
+
+### Sequence parallelism
+
+Splits long sequences across multiple GPUs for training with sequence lengths that would not fit on a single device.
+
+```yaml
+context_parallel_size: 4
+flash_attention: true
+```
+
+See the [multi-GPU guide](/optimizations/multi-gpu) for full configuration.
+
+---
+
+## Distributed training
+
+<CardGroup cols={2}>
+  <Card title="Multi-GPU training" icon="server" href="/optimizations/multi-gpu">
+    DeepSpeed ZeRO, FSDP1/2, DDP, FSDP + QLoRA, sequence parallelism, and N-D parallelism.
+  </Card>
+
+  <Card title="Multi-node training" icon="globe" href="/optimizations/multi-node">
+    Torchrun-based multi-node setup, Ray integration, and required networking configuration.
+  </Card>
+
+  <Card title="Mixed precision" icon="sliders" href="/optimizations/mixed-precision">
+    bf16, fp16, and fp8 configuration with torchao and QAT support.
+  </Card>
+
+  <Card title="LoRA optimizations" icon="rocket" href="/optimizations/lora-optims">
+    Fused Triton kernels, Liger Kernel, Cut Cross Entropy, and ScatterMoE for LoRA training.
+  </Card>
+</CardGroup>
+
+---
+
+## Quantization
+
+### QLoRA (4-bit)
+
+Load the base model in 4-bit using `bitsandbytes` and train LoRA adapters on top.
+
+```yaml
+adapter: qlora
+load_in_4bit: true
+```
+
+### FP8 training
+
+Train with 8-bit floating point on Hopper+ GPUs for significant speed and memory gains.
+
+```yaml
+fp8: true
+torch_compile: true
+```
+
+### Quantization Aware Training (QAT)
+
+Simulates quantization effects during training to improve accuracy of the final quantized model. See the [QAT documentation](/optimizations/mixed-precision) for details.
+
+### MoE expert quantization
+
+Quantizes MoE expert weights on load to reduce VRAM when training MoE models with adapters.
+
+```yaml
+quantize_moe_experts: true
+```

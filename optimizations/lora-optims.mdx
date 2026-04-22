@@ -1,0 +1,236 @@
+---
+title: "LoRA Kernel Optimizations for Faster Training"
+description: "Enable fused Triton kernels for LoRA MLP and attention projections, plus Liger Kernel, Cut Cross Entropy, and ScatterMoE for maximum throughput."
+keywords: ["lora optimizations", "lora kernels", "liger kernel", "cut cross entropy", "scattermoe", "triton", "qlora", "fused kernels"]
+---
+
+Axolotl provides a set of kernel-level optimizations for LoRA and QLoRA fine-tuning that reduce memory usage and increase training throughput through operator fusion and tensor reuse. These optimizations are inspired by [Unsloth](https://github.com/unslothai/unsloth) and implemented with custom autograd functions and Triton kernels.
+
+---
+
+## LoRA MLP and attention kernels
+
+The core LoRA optimizations fuse the LoRA delta computation with the base weight computation in the forward and backward passes of MLP and attention projections. This eliminates redundant memory reads and writes that occur when these operations run separately.
+
+Three config options control the optimized paths:
+
+```yaml
+lora_mlp_kernel: true    # fused MLP path (gate, up, down projections)
+lora_qkv_kernel: true    # fused query-key-value projections
+lora_o_kernel: true      # fused output projection
+```
+
+<Tip>
+Enable all three together for maximum benefit. Each kernel targets a distinct part of the transformer block.
+</Tip>
+
+### What each kernel does
+
+<AccordionGroup>
+  <Accordion title="lora_mlp_kernel">
+    Replaces the standard MLP forward/backward with a single fused autograd function. It handles gate, up, and down projections together, reusing intermediate tensors and calling optimized Triton kernels for the SwiGLU and GeGLU activation functions.
+  </Accordion>
+  <Accordion title="lora_qkv_kernel">
+    Handles query, key, and value projections in a single fused operation. Applied via monkey-patching of the model's attention module. Replaces the standard sequential Q/K/V projection calls with a single `apply_qkv` call that handles both the base weight and LoRA delta.
+  </Accordion>
+  <Accordion title="lora_o_kernel">
+    Handles the output projection at the end of the attention block via a fused `apply_o` call.
+  </Accordion>
+</AccordionGroup>
+
+### Supported model architectures
+
+The kernels work by patching specific code blocks in the model's attention implementation. The following architectures are currently supported:
+
+- `llama`
+- `mistral`
+- `qwen2`
+- `gemma`
+- `gemma2`
+- `gemma3`
+
+<Note>
+LoRA kernels are not supported for RLHF (DPO, KTO, ORPO, GRPO) training — only SFT runs.
+</Note>
+
+### Requirements and limitations
+
+| Requirement | Detail |
+|-------------|--------|
+| GPU | NVIDIA or AMD (Triton required) |
+| LoRA dropout | Must be `0` (disabled) |
+| LoRA bias | Must be disabled |
+| Remote modeling code | Not supported |
+
+<Warning>
+Disabling LoRA dropout may affect model expressivity and increase the risk of overfitting on small datasets. Monitor validation loss closely.
+</Warning>
+
+For AMD GPUs, enable memory-efficient attention support:
+
+```bash
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+```
+
+### Multi-GPU compatibility
+
+LoRA kernels are compatible with all training strategies:
+
+| Strategy | Compatible |
+|----------|:----------:|
+| Single GPU | Yes |
+| DDP | Yes |
+| DeepSpeed | Yes |
+| FSDP2 | Yes |
+
+---
+
+## Liger Kernels
+
+Liger Kernel provides efficient Triton kernel replacements for common LLM operations. Across benchmarks, Liger delivers up to 20% higher multi-GPU training throughput and up to 60% reduction in memory usage.
+
+### Configuration
+
+```yaml
+plugins:
+  - axolotl.integrations.liger.LigerPlugin
+
+liger_rope: true                      # optimized RoPE embedding
+liger_rms_norm: true                  # optimized RMSNorm
+liger_glu_activation: true            # optimized SwiGLU / GeGLU
+liger_layer_norm: true                # optimized LayerNorm
+liger_fused_linear_cross_entropy: true  # fused linear + cross-entropy loss
+
+# Optional: token-level loss scaling (for the fused cross-entropy)
+liger_use_token_scaling: true
+```
+
+### Supported models
+
+Liger Kernel supports a broad set of model families, including:
+
+`llama`, `mistral`, `mixtral`, `qwen2`, `qwen2_vl`, `qwen2_5_vl`, `gemma`, `gemma2`, `gemma3`, `phi3`, `deepseek_v2`, `granite`, `jamba`, `mllama`, `olmo2`, `paligemma`
+
+### Compatibility
+
+Liger Kernel is compatible with both FSDP and DeepSpeed, making it suitable for any multi-GPU training strategy.
+
+---
+
+## Cut Cross Entropy (CCE)
+
+Cut Cross Entropy reduces peak VRAM during the loss calculation step, which can otherwise dominate memory usage when training with large vocabularies.
+
+### Installation
+
+<Tabs>
+  <Tab title="Development environment">
+    ```bash
+    python scripts/cutcrossentropy_install.py | sh
+    ```
+  </Tab>
+  <Tab title="pip install">
+    ```bash
+    pip3 uninstall -y cut-cross-entropy && \
+    pip3 install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@fec1a88"
+    ```
+  </Tab>
+</Tabs>
+
+Requires PyTorch 2.4.0 or higher.
+
+### Configuration
+
+```yaml
+plugins:
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+```
+
+### Supported models
+
+CCE supports a wide range of model architectures including `llama`, `mistral`, `mixtral`, `qwen2`, `qwen3`, `gemma`, `gemma2`, `gemma3`, `gemma4`, `phi3`, `olmo`, `cohere`, `deepseek_v3`, and many others. See the [integration README](https://github.com/axolotl-ai-cloud/axolotl/tree/main/src/axolotl/integrations/cut_cross_entropy) for the full list.
+
+---
+
+## ScatterMoE and SonicMoE
+
+For Mixture of Experts (MoE) architectures, Axolotl provides two optimized expert dispatch kernels that reduce VRAM and improve throughput compared to the standard `grouped_mm` implementation.
+
+### Configuration
+
+```yaml
+plugins:
+  - axolotl.integrations.kernels.KernelsPlugin
+
+use_kernels: true
+
+# Choose one (mutually exclusive):
+use_scattermoe: true   # Triton-based; any CUDA GPU; includes fused LoRA
+# OR
+use_sonicmoe: true     # CUTLASS-based; Hopper/Blackwell only; higher throughput
+```
+
+<Warning>
+`use_scattermoe` and `use_sonicmoe` are mutually exclusive. Do not enable both at the same time.
+</Warning>
+
+### Comparing ScatterMoE and SonicMoE
+
+| Feature | ScatterMoE | SonicMoE |
+|---------|:----------:|:--------:|
+| Kernel backend | Triton | CUTLASS |
+| GPU requirement | Any CUDA | Hopper (H100/H200) or Blackwell |
+| LoRA approach | Fused in Triton kernel | Runtime materialization |
+| LoRA overhead | Lower | Higher |
+| Gate/router LoRA | Yes | Yes |
+| Expert LoRA | Yes (fused) | Yes |
+| `torch.compile` routing | No | Yes (optional) |
+
+### SonicMoE installation
+
+SonicMoE requires additional prerequisites:
+
+- NVIDIA Hopper (H100, H200) or Blackwell (B200, GB200)
+- CUDA 12.9+ (13.0+ for B300)
+- PyTorch 2.7+
+
+```bash
+pip install --ignore-requires-python --no-deps \
+  "sonic-moe @ git+https://github.com/Dao-AILab/sonic-moe.git@116e2df0a41874f77fa0ad269ce7df3f0cfcb956" \
+  && pip install nvidia-cutlass-dsl==4.4.0 quack-kernels==0.2.5
+```
+
+### Supported MoE models
+
+Both kernels support common MoE architectures including `qwen2_moe`, `qwen3_moe`, `mixtral`, `deepseek_v3`, `olmoe`, and many others. SonicMoE supports additional routing strategies that ScatterMoE does not. See the [kernels integration README](https://github.com/axolotl-ai-cloud/axolotl/tree/main/src/axolotl/integrations/kernels) for the full compatibility matrix.
+
+---
+
+## Combining optimizations
+
+LoRA kernels, Liger Kernel, and Cut Cross Entropy can be combined for maximum effect:
+
+```yaml
+adapter: lora
+
+# LoRA-specific fused kernels
+lora_mlp_kernel: true
+lora_qkv_kernel: true
+lora_o_kernel: true
+
+# Liger Kernels (for RMSNorm, RoPE, activations)
+plugins:
+  - axolotl.integrations.liger.LigerPlugin
+liger_rope: true
+liger_rms_norm: true
+liger_glu_activation: true
+liger_fused_linear_cross_entropy: true
+
+# Recommended attention and precision settings
+flash_attention: true
+bf16: auto
+```
+
+<Note>
+When using `liger_fused_linear_cross_entropy: true`, do not also enable the Cut Cross Entropy plugin — they both replace the loss calculation and are incompatible with each other.
+</Note>

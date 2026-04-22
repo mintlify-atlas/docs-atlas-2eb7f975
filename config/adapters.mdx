@@ -1,0 +1,223 @@
+---
+title: "LoRA and QLoRA Adapter Configuration"
+description: "Configure LoRA, QLoRA, and full fine-tuning in Axolotl: adapter type, rank, alpha, target modules, bitsandbytes quantization, and advanced PEFT options."
+---
+
+Axolotl supports three training modes, selected by the `adapter` field. Full fine-tuning updates all model weights. LoRA adds a small number of trainable rank-decomposition matrices while keeping the base model frozen. QLoRA combines 4-bit NF4 quantization of the base model with a LoRA adapter, enabling very large model training on consumer or mid-range hardware.
+
+## Adapter type
+
+<ParamField path="adapter" type="string">
+  The PEFT adapter strategy to use. Omit this field entirely for full fine-tuning.
+
+  | Value | Description |
+  |-------|-------------|
+  | `lora` | Low-Rank Adaptation — adds trainable LoRA matrices; base model is in original precision |
+  | `qlora` | Quantized LoRA — base model loaded in 4-bit NF4; requires `load_in_4bit: true` |
+  | `llama-adapter` | LLaMA-Adapter style prefix tuning |
+
+  ```yaml
+  adapter: lora   # or qlora, or omit for full fine-tune
+  ```
+</ParamField>
+
+<ParamField path="lora_model_dir" type="string">
+  Path to an existing trained LoRA adapter to load before training. Use this to resume adapter training or run inference on a specific checkpoint.
+</ParamField>
+
+## LoRA rank and scaling
+
+<ParamField path="lora_r" type="integer">
+  Rank of the LoRA decomposition matrices. Lower values mean fewer parameters; higher values mean more capacity. Common values: 8, 16, 32, 64, 128. Start with 16 and increase if the model underfits.
+</ParamField>
+
+<ParamField path="lora_alpha" type="integer">
+  Scaling factor for the LoRA update. The effective learning rate scaling is `lora_alpha / lora_r`. A common heuristic is to set `lora_alpha = 2 * lora_r`.
+</ParamField>
+
+<ParamField path="lora_dropout" type="float" default="0.0">
+  Dropout probability applied to the LoRA adapter layers. Values in the range 0.0–0.1 are typical. Set to `0.0` (default) to disable.
+
+  <Note>
+    `lora_dropout` must be `0.0` when using `lora_target_parameters`. PEFT's parameter wrapper does not support non-zero dropout in that mode.
+  </Note>
+</ParamField>
+
+## Target modules
+
+These fields control which weight matrices in the model receive LoRA adapters.
+
+<ParamField path="lora_target_linear" type="boolean">
+  When `true`, applies LoRA adapters to all linear layers in the model. This is the most common option and avoids the need to enumerate module names manually.
+
+  ```yaml
+  lora_target_linear: true
+  ```
+</ParamField>
+
+<ParamField path="lora_target_modules" type="string | string[]">
+  Explicit list of module names (or regex patterns) to apply LoRA to. Mutually exclusive with `lora_target_linear`. Use this when you want precise control over which layers are adapted.
+
+  ```yaml
+  lora_target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  ```
+
+  Or pass the string `"all-linear"` as an alias for targeting all linear modules:
+
+  ```yaml
+  lora_target_modules: all-linear
+  ```
+</ParamField>
+
+<ParamField path="lora_target_parameters" type="string | string[]">
+  Target specific named parameters (by regex) rather than module types. Used for very fine-grained control. Requires `lora_dropout: 0.0`.
+</ParamField>
+
+<ParamField path="peft_layers_to_transform" type="integer[]">
+  Apply LoRA only to these specific transformer block indices. Useful for limiting adapter training to certain depth ranges.
+
+  ```yaml
+  peft_layers_to_transform: [10, 11, 12, 13, 14, 15]
+  ```
+</ParamField>
+
+<ParamField path="lora_modules_to_save" type="string[]">
+  Full modules (not LoRA'd) to also save with the adapter. Required when you add new tokens and need the embedding or head layers to be saved alongside the adapter.
+
+  ```yaml
+  lora_modules_to_save:
+    - embed_tokens
+    - lm_head
+  ```
+</ParamField>
+
+<ParamField path="lora_fan_in_fan_out" type="boolean">
+  Set to `true` for models where weight matrices are stored transposed (e.g., GPT-2 Conv1D layers). Not needed for most modern models.
+</ParamField>
+
+## Advanced PEFT options
+
+<ParamField path="peft_use_rslora" type="boolean">
+  Use Rank-Stabilized LoRA (RSLoRA), which scales the LoRA updates by `1/sqrt(r)` instead of `1/r`. Can improve stability at higher ranks.
+</ParamField>
+
+<ParamField path="peft_use_dora" type="boolean">
+  Use Weight-Decomposed Low-Rank Adaptation (DoRA), which decomposes weights into magnitude and direction components. Can improve fine-tuning quality.
+</ParamField>
+
+<ParamField path="peft_init_lora_weights" type="boolean | string">
+  Controls how LoRA weights are initialized. Defaults to `true` (Microsoft's original implementation). Set to `"loftq"` to use LoftQ initialization.
+</ParamField>
+
+<ParamField path="peft_autocast_adapter_dtype" type="boolean">
+  Whether to upcast LoRA adapter weights to fp32. Enabled by default in PEFT. Set to `false` to keep adapters in the training dtype for lower memory usage on low-VRAM GPUs.
+</ParamField>
+
+<ParamField path="loraplus_lr_ratio" type="float">
+  LoRA+ learning rate ratio `lr_B / lr_A`. The paper recommends `2^4 = 16`. When set, matrix B is trained at a higher rate than matrix A.
+</ParamField>
+
+<ParamField path="loraplus_lr_embedding" type="float" default="1e-6">
+  Learning rate applied to LoRA embedding layers when using LoRA+. Default is `1e-6`.
+</ParamField>
+
+## 4-bit quantization options (QLoRA)
+
+These settings configure the bitsandbytes NF4 quantization used when `adapter: qlora`.
+
+<ParamField path="bnb_config_kwargs" type="object">
+  Optional overrides to the bitsandbytes 4-bit quantization config. Common keys:
+
+  | Key | Default | Description |
+  |-----|---------|-------------|
+  | `bnb_4bit_quant_type` | `nf4` | Quantization type: `nf4` or `fp4` |
+  | `bnb_4bit_use_double_quant` | `true` | Double quantization to reduce memory further |
+  | `blocksize` | `64` | Block size for quantization |
+
+  ```yaml
+  bnb_config_kwargs:
+    bnb_4bit_quant_type: nf4
+    bnb_4bit_use_double_quant: true
+  ```
+</ParamField>
+
+<ParamField path="lora_on_cpu" type="boolean">
+  Load LoRA/PEFT weights on CPU. Required when the base model is so large it leaves no GPU memory for the adapter weights.
+</ParamField>
+
+<ParamField path="qlora_sharded_model_loading" type="boolean" default="false">
+  Load the QLoRA model in sharded format for FSDP training using the answer.ai technique. Only needed for very large models with FSDP.
+</ParamField>
+
+## LoRA merge options
+
+<ParamField path="merge_method" type="string" default="memory_efficient">
+  Algorithm used when running `axolotl merge-lora`. Options:
+
+  | Value | Description |
+  |-------|-------------|
+  | `memory_efficient` | Processes shards one at a time; does not load full model into VRAM |
+  | `legacy` | Loads full model into memory before merging; simpler but uses more memory |
+</ParamField>
+
+## Example configs
+
+<Tabs>
+  <Tab title="LoRA (standard)">
+    ```yaml
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    adapter: lora
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_linear: true
+    bf16: true
+    flash_attention: true
+    ```
+  </Tab>
+  <Tab title="QLoRA (4-bit)">
+    ```yaml
+    base_model: meta-llama/Llama-3.1-70B-Instruct
+    adapter: qlora
+    load_in_4bit: true
+    lora_r: 64
+    lora_alpha: 128
+    lora_dropout: 0.05
+    lora_target_linear: true
+    bnb_config_kwargs:
+      bnb_4bit_quant_type: nf4
+      bnb_4bit_use_double_quant: true
+    bf16: true
+    flash_attention: true
+    ```
+  </Tab>
+  <Tab title="Full fine-tune">
+    ```yaml
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    # No `adapter` field = full fine-tune
+    bf16: true
+    flash_attention: true
+    gradient_checkpointing: true
+    ```
+  </Tab>
+  <Tab title="LoRA with RSLoRA + DoRA">
+    ```yaml
+    base_model: mistralai/Mistral-7B-v0.3
+    adapter: lora
+    lora_r: 32
+    lora_alpha: 64
+    lora_dropout: 0.0
+    lora_target_linear: true
+    peft_use_rslora: true
+    peft_use_dora: true
+    bf16: true
+    ```
+  </Tab>
+</Tabs>
